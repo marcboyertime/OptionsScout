@@ -1,0 +1,9 @@
+# Repository profile only. OAuth configuration remains outside this repository.
+[mcp_servers.robinhood-trading]
+url = "https://agent.robinhood.com/mcp/trading"
+enabled = false
+enabled_tools = []
+
+[options_scout]
+mode = "read_only_research"
+fail_closed_on_unknown_tools = true

@@ -1,0 +1,304 @@
+{
+  "schema_version": "1",
+  "metadata": {
+    "run_id": "fixture-index-001",
+    "as_of": "2026-08-11T15:00:00+00:00",
+    "retrieved_at": "2026-08-11T15:00:30+00:00",
+    "config_version": "fixture-config-1",
+    "model_version": "fixture-model-1",
+    "prompt_version": "fixture-prompt-1"
+  },
+  "source_label": "LIVE",
+  "fixture": true,
+  "candidates": [
+    {
+      "id": "fixidx-001",
+      "symbol": "FIXIDX",
+      "underlying": "100.00",
+      "underlying_as_of": "2026-08-11T15:00:00+00:00",
+      "contracts": [
+        {
+          "id": "c100",
+          "symbol": "FIXIDX",
+          "expiration": "2026-08-21",
+          "strike": "100",
+          "type": "call",
+          "quote": {
+            "bid": "1.00",
+            "ask": "1.10",
+            "as_of": "2026-08-11T15:00:00+00:00",
+            "iv": "0.30",
+            "delta": "0.50",
+            "vega": "0.10",
+            "volume": 100,
+            "open_interest": 1000
+          },
+          "tradable": true,
+          "multiplier": 100,
+          "adjusted": false,
+          "exercise_style": "European",
+          "settlement_style": "cash"
+        },
+        {
+          "id": "c105",
+          "symbol": "FIXIDX",
+          "expiration": "2026-08-21",
+          "strike": "105",
+          "type": "call",
+          "quote": {
+            "bid": "0.30",
+            "ask": "0.40",
+            "as_of": "2026-08-11T15:00:00+00:00",
+            "iv": "0.28",
+            "delta": "0.20",
+            "vega": "0.06",
+            "volume": 100,
+            "open_interest": 1000
+          },
+          "tradable": true,
+          "multiplier": 100,
+          "adjusted": false,
+          "exercise_style": "European",
+          "settlement_style": "cash"
+        }
+      ],
+      "structures": [
+        {
+          "id": "cash_call_debit",
+          "name": "cash_call_debit",
+          "quantity": 1,
+          "legs": [
+            {
+              "side": "buy",
+              "contract_id": "c100",
+              "ratio": 1
+            },
+            {
+              "side": "sell",
+              "contract_id": "c105",
+              "ratio": 1
+            }
+          ]
+        }
+      ],
+      "selected_structure_id": "cash_call_debit",
+      "thesis": {
+        "implied_probability_low": "0.45",
+        "implied_probability_high": "0.50",
+        "outcome": "Market currently prices approximately 45-50 percent odds of a move above 102; the fixture is deliberately non-operational.",
+        "why_wrong": "The synthetic fixture is intentionally incomplete for live use.",
+        "why_not_arbitraged": "No arbitrage claim is made for fixture data.",
+        "falsifier": "Falsified if reviewed live sources disagree.",
+        "assumptions": [
+          "Synthetic source is illustrative only"
+        ],
+        "catalyst": "Fixture review catalyst",
+        "catalyst_type": "other",
+        "catalyst_at": "2026-08-20T14:00:00+00:00",
+        "timing_trigger": "Review before the listed expiry",
+        "narratives": [
+          "Illustrative index volatility"
+        ],
+        "underappreciation": "No live underappreciation is asserted."
+      },
+      "sources": [
+        {
+          "id": "source-fixture",
+          "title": "Synthetic fixture source",
+          "publisher": "OptionsScout tests",
+          "url": "https://example.invalid/fixture",
+          "published_at": "2026-08-11T14:59:00+00:00",
+          "event_at": "2026-08-11T14:59:00+00:00",
+          "retrieved_at": "2026-08-11T15:00:20+00:00",
+          "primary": true,
+          "claim_ids": [
+            "claim-fixture"
+          ]
+        }
+      ],
+      "claims": [
+        {
+          "id": "claim-fixture",
+          "text": "Synthetic fixture is non-operational.",
+          "source_ids": [
+            "source-fixture"
+          ],
+          "inference": "Fixture data cannot establish a trade.",
+          "confidence": "1"
+        }
+      ],
+      "equity_context": {
+        "tradable": true,
+        "options_available": true,
+        "underlying_liquidity": "1000000",
+        "returns": [
+          "0.01",
+          "-0.01"
+        ],
+        "volume": "1000000",
+        "realized_volatility": "0.20",
+        "sector_behavior": "index",
+        "factor_behavior": "broad market",
+        "sector_beta": "1",
+        "factor_adjusted": true,
+        "material_move_pct": "0.00",
+        "technical_trigger": "Illustrative trigger",
+        "contradictions": []
+      },
+      "quote_provenance": {
+        "source_id": "source-fixture",
+        "retrieved_at": "2026-08-11T15:00:20+00:00",
+        "as_of": "2026-08-11T15:00:00+00:00",
+        "source": "LIVE",
+        "methodology": "Synthetic deterministic fixture"
+      },
+      "mechanics": {
+        "asset_type": "index option",
+        "product_type": "index",
+        "exercise_style": "European",
+        "settlement_style": "cash",
+        "deliverable": "cash index difference",
+        "ex_dividend_date": null,
+        "ex_dividend_amount": null,
+        "assignment_risk": "No early assignment for European cash settlement",
+        "pin_risk": "Cash settlement only",
+        "auto_exercise": "Cash-settlement procedure documented",
+        "corporate_action": "No adjusted contract",
+        "product_calendar": "Synthetic exchange calendar"
+      },
+      "fill_plan": {
+        "order_type": "limit",
+        "limit": "80.00",
+        "rationale": "Whole-complex debit target",
+        "max_slippage": "0.05"
+      },
+      "structure_plan": {
+        "structure_type": "call debit spread",
+        "one_complex_order": true,
+        "entry_limit": "80.00",
+        "max_acceptable_limit": "85.00",
+        "fees": "1.00",
+        "commissions": "0.00",
+        "exit_slippage": "0.05",
+        "exit_plan": {
+          "required_before_expiry": false,
+          "close_buffer_days": 1,
+          "profit_plan": "Illustrative close plan",
+          "invalidation": "Live source mismatch",
+          "catalyst_hold": "Do not hold fixture",
+          "underlying_invalidation": "Underlying threshold invalidates; close",
+          "thesis_invalidation": "Thesis evidence invalidates; close",
+          "volatility_invalidation": "Volatility regime invalidates; close",
+          "time_exit_at": "2026-08-20T20:00:00+00:00",
+          "time_exit_rationale": "Exit before expiration",
+          "rapid_double_response": "Take profit or reassess",
+          "loss_50_response": "Close at 50 percent loss",
+          "direction_correct_iv_wrong_response": "Close/reassess IV thesis",
+          "sector_only_response": "Close if company thesis fails",
+          "expiration_management": "Close before expiration",
+          "assignment_management": "No assignment; close if mechanics change",
+          "roll_policy": "No automatic roll; new full analysis required"
+        }
+      },
+      "surface_nodes": [
+        {
+          "expiration": "2026-08-21",
+          "strike": "100",
+          "option_type": "call",
+          "implied_volatility": "0.30",
+          "delta": "0.50"
+        }
+      ],
+      "iv_snapshot": {
+        "as_of": "2026-08-11T15:00:00+00:00",
+        "atm_iv": "0.30",
+        "skew": "0.02",
+        "term_structure": [
+          "0.30",
+          "0.28"
+        ]
+      },
+      "event_history": [
+        {
+          "event_type": "synthetic observation",
+          "event_at": "2026-08-11T14:00:00+00:00",
+          "observed_move_pct": "0.01",
+          "notes": "Fixture-only observation"
+        }
+      ],
+      "upcoming_events": [],
+      "volatility": {
+        "implied_move_pct": "0.04",
+        "realized_volatility": "0.20"
+      },
+      "distribution": {
+        "scenario_model": "bounded_terminal_spot_v1",
+        "provenance": "Synthetic bounded terminal distribution; 30-day support uses implied move, realized volatility, and recorded historical event observations.",
+        "scenarios": [
+          {
+            "id": "up",
+            "outcome": "up",
+            "probability": "0.50",
+            "expiration_spot": "110",
+            "payoff": "413.90"
+          },
+          {
+            "id": "flat",
+            "outcome": "flat",
+            "probability": "0.50",
+            "expiration_spot": "100",
+            "payoff": "-86.10"
+          }
+        ],
+        "sensitivity_cases": [
+          {
+            "id": "adverse_shift",
+            "model": "adverse_probability_shift_v1",
+            "probability_shift_to_worst": "0.05",
+            "additional_cost": "0",
+            "expected_value": "138.90"
+          }
+        ]
+      },
+      "portfolio_assessment": {
+        "positions": [],
+        "limits": {
+          "hard_cap": "1000",
+          "remaining_aggregate": "1000",
+          "remaining_cluster": "1000",
+          "remaining_event": "1000",
+          "remaining_sector": "1000",
+          "remaining_factor": "1000"
+        },
+        "correlations": [],
+        "aggregate_risk": "80",
+        "cluster_risk": "80",
+        "event_risk": "80",
+        "sector_risk": "80",
+        "factor_risk": "80",
+        "deficit_elimination_rationale": "European cash-settled defined-risk fixture"
+      },
+      "skeptic": {
+        "opposing_view": "Synthetic data has no live validity.",
+        "weakest_evidence": "All fixture evidence",
+        "key_assumption": "Fixture semantics",
+        "crowding": "Unknown",
+        "beta": "Illustrative",
+        "iv": "Illustrative",
+        "liquidity": "Illustrative",
+        "total_loss": "Defined synthetic loss"
+      },
+      "judge": {
+        "verdict": "reject operational use",
+        "reason": "Fixture mode is permanently non-actionable."
+      },
+      "watch_triggers": [
+        {
+          "condition": "Replace with audited live input",
+          "expires_at": "2026-08-21T20:00:00+00:00",
+          "action": "Re-run research only"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,20 @@
+{
+  "schema_version": "1",
+  "tool": "fixture.normalized-run",
+  "schema_identity": "options-scout.fixture.normalized-run/v1",
+  "redacted_arguments": {},
+  "fixture_namespace": "options-scout.fixture.v1",
+  "capture_id": "demo-capture",
+  "as_of": "2026-08-11T11:56:29.923573+00:00",
+  "retrieved_at": "2026-08-11T11:56:29.923573+00:00",
+  "field_provenance": {
+    "note": "fixture"
+  },
+  "source_label": "ESTIMATED",
+  "payload": {
+    "note": "demo only",
+    "contracts": []
+  },
+  "payload_hash": "384c3b83ad7635e0279cbc52feb4ae6b030ff6984be3bb45c0758776f17d8e84",
+  "normalized_input_hash": "89f15c004ec6b789619da98a3bf331bf03b4a837921d06d8d4bc542945dafe68"
+}

@@ -1,0 +1,14 @@
+{
+  "version": "1",
+  "max_universe": 40,
+  "categories": {
+    "broad_market": ["SPY", "QQQ", "IWM", "DIA"],
+    "technology": ["XLK", "IGV"],
+    "semiconductors": ["SMH", "SOXX"],
+    "biotech": ["XBI", "IBB"],
+    "energy": ["XLE", "USO"],
+    "financials": ["XLF", "KRE"],
+    "rates": ["TLT", "IEF"],
+    "liquid_factors": ["GLD", "XLV", "XLY", "XLU", "XLRE"]
+  }
+}

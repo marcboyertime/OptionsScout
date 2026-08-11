@@ -1,0 +1,11 @@
+{
+  "max_risk_per_trade_usd": "1000",
+  "remaining_aggregate_risk_usd": "900",
+  "remaining_cluster_risk_usd": "700",
+  "remaining_event_risk_usd": "650",
+  "remaining_sector_risk_usd": "600",
+  "remaining_factor_risk_usd": "550",
+  "trade_risk_usd": "500",
+  "duplicate_exposure": false,
+  "clusters": ["synthetic-index"]
+}

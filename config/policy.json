@@ -1,0 +1,26 @@
+{
+  "version": "phase1-2026-08-11",
+  "max_risk_per_trade_usd": "1000",
+  "outer_operational_containment_usd": "1000",
+  "fees_per_contract_usd": "0",
+  "physical_settlement_exit_before_expiration": true,
+  "max_dte": 30,
+  "quote_max_age_seconds": 90,
+  "leg_sync_max_seconds": 15,
+  "liquidity": {
+    "underlying_minimum_usd": "100000",
+    "single_leg_min_volume": 1,
+    "single_leg_min_open_interest": 25,
+    "complex_or_early_exit_min_volume": 10,
+    "complex_or_early_exit_min_open_interest": 100,
+    "premium_bands": [
+      {"max_premium": "1", "max_relative_spread": "0.25", "max_absolute_spread": "0.20"},
+      {"max_premium": "5", "max_relative_spread": "0.20", "max_absolute_spread": "0.50"},
+      {"max_premium": null, "max_relative_spread": "0.15", "max_absolute_spread": "1.00"}
+    ]
+  },
+  "enabled_tools": [],
+  "approved_capture_schemas": [],
+  "denied_tool_patterns": ["place_", "cancel_", "replace_", "roll_", "exercise", "transfer", "deposit", "withdraw", "fund", "account_setting"],
+  "allow_live_without_catalog": false
+}

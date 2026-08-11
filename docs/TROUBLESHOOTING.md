@@ -1,0 +1,11 @@
+# Troubleshooting
+
+- `DATA_INSUFFICIENT` with unavailable MCP catalog is expected when the current task did not expose schemas. Start a fresh authenticated Codex task and inspect the catalog; add no unknown tool name to the allowlist.
+- The current exact-empty allowlist is correct. Do not add placeholder names. A human must compare fresh tool names and schemas against the project policy before enabling any read-only market-data capture.
+- `MARKET_CLOSED_OR_STALE`/freshness failures are protective. Do not use cached or fixture values for actionability.
+- `calendar unavailable` means the installed `exchange-calendars` provider failed to load or the supplied product calendar is unknown. XNYS is available by default and handles New York holidays, early closes, DST, and regular/pre/after classification. Test product-specific calendars and late closes before mapping them; unknown mappings fail closed.
+- `INVALIDATED` after a >2% preflight move requires a complete fresh analysis. Compare any future manual trade only with Robinhood's live review screen; OptionsScout never submits.
+- If `options-scout` is installed but launched outside the checkout, use the generated console script. Set `OPTIONS_SCOUT_ROOT` only to a deliberate deployment directory when you want local artifacts/configuration elsewhere; no launcher `sys.path` or current-directory hack is required.
+- Run `health --json` for SQLite integrity and `safety-audit --json` for hash-chain, policy, schedule, redaction, and executable-invocation checks. A failed integrity check means preserve the database as evidence and initialize a new workspace; do not edit immutable rows.
+
+- Setup/recovery: create a new virtual environment, install `pip install '.[dev]'` (not editable), run `options-scout --help`, `options-scout init --json`, then `health --json`. The standard project console script works outside the checkout. On this Python 3.14/macOS environment an editable install can create a hidden `.pth` file that Python correctly skips; recreate the environment with the non-editable local install instead of applying filesystem-flag workarounds. If an existing DB reports a bad chain, preserve it as evidence, select a fresh `OPTIONS_SCOUT_ROOT`, initialize there, and do not repair rows in place.

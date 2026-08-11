@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=80,<82"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "options-scout"
+version = "0.1.0"
+description = "Local-first, read-only options research scanner"
+requires-python = ">=3.14"
+dependencies = ["exchange-calendars>=4.10,<5"]
+
+[project.scripts]
+options-scout = "options_scout.cli:main"
+
+[project.optional-dependencies]
+dev = ["pytest>=8.3,<9", "ruff>=0.12,<0.13", "mypy>=1.15,<1.16"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+options_scout = ["fixtures/*.json"]
+
+[tool.ruff]
+target-version = "py314"
+line-length = 100
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.14"
+strict = true
+warn_unreachable = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

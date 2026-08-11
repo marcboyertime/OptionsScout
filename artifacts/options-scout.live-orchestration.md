@@ -1,0 +1,3 @@
+# Disabled OptionsScout live orchestration
+
+Use the OptionsScout skill. Respect `OPTIONS_SCOUT_SCHEDULE_MODE`: deep premarket/after-close/weekend work may refresh the bounded universe and dated catalysts, while regular mode is a lightweight refresh and must begin at least 15 minutes after the open. Inspect only the reviewed catalog; invoke only exact positive-allowlisted read-only market-data tools. Never access account, balance, position, or order data. Create only an already-redacted capture envelope and bound normalized typed run, then run `options-scout capture-ingest --capture-input ...` before `options-scout scan --input ...`. Never submit or mutate anything.
