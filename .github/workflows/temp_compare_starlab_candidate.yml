@@ -1,0 +1,127 @@
+name: Temporary compare StarLab candidate
+
+"on":
+  push:
+    branches:
+      - temp-identify-bad-friends-song-20260904
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Download recovered montage recognition artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: bad-friends-montage-recognition-results
+          path: input
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: marcboyertime/OptionsScout
+          run-id: 33840549645
+
+      - name: Download Apple preview and prepare tools
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg curl
+          python -m pip install --upgrade numpy scipy librosa soundfile shazamio==0.8.1
+          mkdir -p candidate results
+          curl -L --fail --retry 5 --retry-all-errors --connect-timeout 20 \
+            'https://audio-ssl.itunes.apple.com/itunes-assets/AudioPreview112/v4/2a/65/72/2a6572ac-7862-ad6f-c4c6-fb0a483b6880/mzaf_2698493566100487735.plus.aac.ep.m4a' \
+            -o candidate/starlab_aliens_preview.m4a
+          ffmpeg -hide_banner -loglevel error -y \
+            -i candidate/starlab_aliens_preview.m4a -ac 1 -ar 22050 -c:a pcm_s16le \
+            candidate/starlab_aliens_preview.wav
+          ffprobe -v error -show_entries format=duration,size -of default=noprint_wrappers=1 \
+            candidate/starlab_aliens_preview.m4a
+
+      - name: Compare fingerprints and acoustic alignment
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cat > compare.py <<'PY'
+          import asyncio
+          import json
+          from pathlib import Path
+          import numpy as np
+          import librosa
+          from scipy.signal import correlate
+          from shazamio import Shazam
+
+          montage_paths = [
+              Path('input/audio/original_stereo.wav'),
+              Path('input/audio/original_mono_norm.wav'),
+              Path('input/audio/wide_music_norm.wav'),
+              Path('input/audio/side_music_norm.wav'),
+          ]
+          candidate_path = Path('candidate/starlab_aliens_preview.wav')
+
+          def norm_rows(x):
+              return x / (np.linalg.norm(x, axis=0, keepdims=True) + 1e-8)
+
+          results = []
+          y_c, sr = librosa.load(candidate_path, sr=22050, mono=True)
+          hop = 512
+          c_c = norm_rows(librosa.feature.chroma_cqt(y=y_c, sr=sr, hop_length=hop))
+          m_c = librosa.feature.melspectrogram(y=y_c, sr=sr, n_mels=64, hop_length=hop)
+          l_c = librosa.power_to_db(m_c, ref=np.max)
+          l_c = (l_c - l_c.mean(axis=1, keepdims=True)) / (l_c.std(axis=1, keepdims=True) + 1e-8)
+
+          for path in montage_paths:
+              y_m, _ = librosa.load(path, sr=sr, mono=True)
+              c_m = norm_rows(librosa.feature.chroma_cqt(y=y_m, sr=sr, hop_length=hop))
+              # Subsequence DTW: candidate preview features against montage.
+              D, wp = librosa.sequence.dtw(X=c_c, Y=c_m, metric='cosine', subseq=True)
+              end_idx = int(np.argmin(D[-1]))
+              wp_path = librosa.sequence.dtw(X=c_c, Y=c_m, metric='cosine', subseq=True, backtrack=True)[1]
+              # Local chroma similarity by sliding candidate chunks of 10 s over montage.
+              win_frames = max(1, round(10 * sr / hop))
+              scores=[]
+              for ci in range(0, max(1, c_c.shape[1]-win_frames+1), max(1, win_frames//4)):
+                  cc=c_c[:,ci:ci+win_frames]
+                  if cc.shape[1]<win_frames: continue
+                  for mi in range(0, max(1, c_m.shape[1]-win_frames+1)):
+                      mm=c_m[:,mi:mi+win_frames]
+                      if mm.shape[1]<win_frames: continue
+                      score=float(np.mean(np.sum(cc*mm,axis=0)))
+                      scores.append((score,ci,mi))
+              best=max(scores) if scores else (None,None,None)
+              results.append({
+                  'montage_file': str(path),
+                  'dtw_min_cost': float(np.min(D[-1])),
+                  'dtw_end_seconds': end_idx*hop/sr,
+                  'best_10s_chroma_similarity': best[0],
+                  'candidate_start_seconds': None if best[1] is None else best[1]*hop/sr,
+                  'montage_start_seconds': None if best[2] is None else best[2]*hop/sr,
+              })
+
+          async def recognize(path):
+              out=await Shazam().recognize(str(path))
+              t=out.get('track') or {}
+              return {'title':t.get('title'),'artist':t.get('subtitle'),'key':t.get('key'),'matches':out.get('matches')}
+
+          rec=asyncio.run(recognize(candidate_path))
+          payload={'candidate_shazam':rec,'comparisons':results}
+          Path('results/comparison.json').write_text(json.dumps(payload,indent=2))
+          print(json.dumps(payload,indent=2))
+          PY
+          python compare.py | tee results/comparison_console.txt
+
+          # Preserve the preview and a short montage section associated with the repeated match.
+          ffmpeg -hide_banner -loglevel error -y -ss 20 -i input/audio/original_stereo.wav -t 28 \
+            -c:a libmp3lame -b:a 192k results/montage_middle_20s-48s.mp3
+          ffmpeg -hide_banner -loglevel error -y -i candidate/starlab_aliens_preview.m4a \
+            -c:a libmp3lame -b:a 192k results/starlab_aliens_preview.mp3
+
+      - name: Upload comparison evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: starlab-candidate-comparison
+          path: results/
+          if-no-files-found: error
+          retention-days: 1
