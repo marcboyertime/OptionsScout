@@ -1,0 +1,207 @@
+name: Temporary external music recognition
+
+"on":
+  push:
+    branches:
+      - temp-external-music-recognition-20260904
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  recognize:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: songfinder
+            url: https://songfinder.gg/
+          - name: melodyseek
+            url: https://melodyseek.io/
+          - name: tracktune
+            url: https://tracktune.online/
+          - name: aha
+            url: https://aha-music.com/upload
+          - name: iloveaudios
+            url: https://www.iloveaudios.com/tools/song-extractor
+          - name: musci
+            url: https://musci.io/music-finder
+    runs-on: ubuntu-latest
+    timeout-minutes: 18
+    steps:
+      - name: Download separated montage
+        uses: actions/download-artifact@v4
+        with:
+          name: bad-friends-demucs-identification
+          path: input
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: marcboyertime/OptionsScout
+          run-id: 33841219671
+
+      - name: Prepare browser and clips
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          mkdir -p work results
+          source_file="$(find input -type f -name montage_no_dialogue.mp3 | head -n 1)"
+          test -n "$source_file"
+          cp "$source_file" work/montage_no_dialogue.mp3
+          ffmpeg -hide_banner -loglevel error -y -ss 8 -i "$source_file" -t 30 \
+            -c:a libmp3lame -b:a 192k work/core_08s-38s.mp3
+          ffmpeg -hide_banner -loglevel error -y -ss 30 -i "$source_file" -t 30 \
+            -c:a libmp3lame -b:a 192k work/core_30s-60s.mp3
+          npm init -y
+          npm install playwright
+          npx playwright install --with-deps chromium
+
+      - name: Upload and capture recognition result
+        continue-on-error: true
+        env:
+          SITE_NAME: ${{ matrix.name }}
+          SITE_URL: ${{ matrix.url }}
+        shell: bash
+        run: |
+          set -u
+          cat > recognize_external.js <<'JS'
+          const { chromium } = require('playwright');
+          const fs = require('fs');
+          const path = require('path');
+
+          const siteName = process.env.SITE_NAME;
+          const siteUrl = process.env.SITE_URL;
+          const outDir = path.resolve('results');
+          fs.mkdirSync(outDir, { recursive: true });
+          const log = [];
+          const responses = [];
+          const consoleLines = [];
+          const record = (...args) => { const line = args.map(String).join(' '); log.push(line); console.log(line); };
+
+          async function clickLikely(page) {
+            const regexes = [/identify/i, /find.*song/i, /find.*music/i, /recogn/i, /analy[sz]e/i, /search/i, /submit/i, /upload/i];
+            for (const re of regexes) {
+              const locator = page.getByRole('button', { name: re }).filter({ visible: true });
+              const count = await locator.count().catch(() => 0);
+              for (let i = 0; i < Math.min(count, 5); i++) {
+                const el = locator.nth(i);
+                if (await el.isVisible().catch(() => false) && await el.isEnabled().catch(() => false)) {
+                  const text = await el.innerText().catch(() => '');
+                  if (/sign|login|google|subscribe|pricing/i.test(text)) continue;
+                  record('click button:', JSON.stringify(text));
+                  await el.click({ timeout: 5000 }).catch(e => record('click failed:', e.message));
+                  await page.waitForTimeout(2500);
+                  return true;
+                }
+              }
+            }
+            return false;
+          }
+
+          async function attemptFile(page, filePath, label) {
+            record('attempt file', label, filePath);
+            let inputs = page.locator('input[type="file"]');
+            let n = await inputs.count().catch(() => 0);
+            record('file input count', n);
+            if (!n) {
+              // Click likely upload/dropzone controls to reveal the hidden input.
+              const triggers = page.getByText(/upload|choose|select|browse|drag.*drop|click.*upload/i);
+              const tn = await triggers.count().catch(() => 0);
+              for (let i = 0; i < Math.min(tn, 8); i++) {
+                const el = triggers.nth(i);
+                if (await el.isVisible().catch(() => false)) {
+                  await el.click({ timeout: 3000 }).catch(() => {});
+                  await page.waitForTimeout(1000);
+                  n = await page.locator('input[type="file"]').count().catch(() => 0);
+                  if (n) break;
+                }
+              }
+            }
+            inputs = page.locator('input[type="file"]');
+            n = await inputs.count().catch(() => 0);
+            if (!n) throw new Error('No file input found');
+            let set = false;
+            for (let i = 0; i < n; i++) {
+              try {
+                await inputs.nth(i).setInputFiles(filePath, { timeout: 10000 });
+                set = true;
+                record('set input', i);
+                break;
+              } catch (e) { record('input', i, 'failed', e.message); }
+            }
+            if (!set) throw new Error('Unable to set any file input');
+            await page.waitForTimeout(3000);
+            await page.screenshot({ path: path.join(outDir, `${siteName}_${label}_after_file.png`), fullPage: true }).catch(() => {});
+            for (let i = 0; i < 4; i++) {
+              const clicked = await clickLikely(page);
+              if (!clicked) break;
+              await page.waitForTimeout(5000);
+            }
+            const deadline = Date.now() + 105000;
+            let lastText = '';
+            while (Date.now() < deadline) {
+              await page.waitForTimeout(5000);
+              const text = await page.locator('body').innerText().catch(() => '');
+              if (text !== lastText) {
+                record('body changed, length', text.length);
+                lastText = text;
+              }
+              if (/result|identified|match|artist|album|no match|not found|couldn.t identify|unable to identify/i.test(text)) {
+                // Keep a little extra time for a result card to settle.
+                await page.waitForTimeout(7000);
+                break;
+              }
+              await clickLikely(page);
+            }
+            const body = await page.locator('body').innerText().catch(() => '');
+            fs.writeFileSync(path.join(outDir, `${siteName}_${label}_body.txt`), body);
+            fs.writeFileSync(path.join(outDir, `${siteName}_${label}_html.txt`), await page.content().catch(() => ''));
+            await page.screenshot({ path: path.join(outDir, `${siteName}_${label}_final.png`), fullPage: true }).catch(() => {});
+            return body;
+          }
+
+          (async () => {
+            const browser = await chromium.launch({ headless: true, args: ['--no-sandbox', '--disable-dev-shm-usage'] });
+            const context = await browser.newContext({ viewport: { width: 1440, height: 1100 }, userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140.0.0.0 Safari/537.36' });
+            const page = await context.newPage();
+            page.on('console', msg => consoleLines.push(`${msg.type()}: ${msg.text()}`));
+            page.on('response', async response => {
+              const ct = response.headers()['content-type'] || '';
+              if (/json|text/.test(ct) || /api|recogn|identify|upload|search|result/i.test(response.url())) {
+                let body = '';
+                try { body = (await response.text()).slice(0, 200000); } catch {}
+                responses.push({ url: response.url(), status: response.status(), contentType: ct, body });
+              }
+            });
+            try {
+              record('navigate', siteUrl);
+              await page.goto(siteUrl, { waitUntil: 'domcontentloaded', timeout: 90000 });
+              await page.waitForTimeout(7000);
+              await page.screenshot({ path: path.join(outDir, `${siteName}_initial.png`), fullPage: true }).catch(() => {});
+              let body = await attemptFile(page, path.resolve('work/core_08s-38s.mp3'), 'core1');
+              if (!/artist|album|identified|match/i.test(body) || /no match|not found|unable/i.test(body)) {
+                record('first attempt inconclusive; reloading for second core segment');
+                await page.goto(siteUrl, { waitUntil: 'domcontentloaded', timeout: 90000 });
+                await page.waitForTimeout(5000);
+                await attemptFile(page, path.resolve('work/core_30s-60s.mp3'), 'core2');
+              }
+            } catch (e) {
+              record('fatal', e.stack || e.message);
+            }
+            fs.writeFileSync(path.join(outDir, `${siteName}_network.json`), JSON.stringify(responses, null, 2));
+            fs.writeFileSync(path.join(outDir, `${siteName}_console.txt`), consoleLines.join('\n'));
+            fs.writeFileSync(path.join(outDir, `${siteName}_runlog.txt`), log.join('\n'));
+            await browser.close();
+          })();
+          JS
+          node recognize_external.js
+
+      - name: Upload service evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: external-recognition-${{ matrix.name }}
+          path: results/
+          if-no-files-found: warn
+          retention-days: 1
