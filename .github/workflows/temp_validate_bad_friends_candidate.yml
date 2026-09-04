@@ -1,0 +1,249 @@
+name: Temporary validate Bad Friends candidate
+
+"on":
+  push:
+    branches:
+      - temp-identify-bad-friends-song-20260904
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Download montage recognition artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: bad-friends-montage-recognition-results
+          path: input
+          github-token: ${{ github.token }}
+          repository: marcboyertime/OptionsScout
+          run-id: 33840549645
+
+      - name: Prepare analysis tools
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg curl jq
+          python -m pip install --upgrade "numpy<3" scipy librosa soundfile
+          mkdir -p candidates/wav results
+
+      - name: Download catalog previews
+        shell: bash
+        run: |
+          set -euxo pipefail
+          declare -A ids=(
+            [aliens_starlab]=1625061866
+            [winter_of_fullness]=6796128383
+            [no_escape_g32]=1891521213
+            [ginnungagap]=1558310397
+            [osf_gradient]=1872779099
+          )
+          : > results/catalog_metadata.jsonl
+          for name in "${!ids[@]}"; do
+            id="${ids[$name]}"
+            curl -fsSL --retry 3 "https://itunes.apple.com/lookup?id=${id}&country=us" -o "candidates/${name}.json"
+            jq -c '.results[0] // {}' "candidates/${name}.json" >> results/catalog_metadata.jsonl
+            preview="$(jq -r '.results[0].previewUrl // empty' "candidates/${name}.json")"
+            test -n "$preview"
+            curl -fL --retry 3 -A 'Mozilla/5.0' "$preview" -o "candidates/${name}.m4a"
+            ffmpeg -hide_banner -loglevel error -y -i "candidates/${name}.m4a" \
+              -vn -ac 1 -ar 22050 -c:a pcm_s16le "candidates/wav/${name}.wav"
+            ffprobe -v error -show_entries format=duration,size -of default=noprint_wrappers=1 "candidates/wav/${name}.wav"
+          done
+
+      - name: Compare fingerprints and musical structure
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cat > compare.py <<'PY'
+          import json
+          from pathlib import Path
+          from collections import defaultdict, Counter
+          import numpy as np
+          import librosa
+          from scipy.ndimage import maximum_filter
+
+          SR = 11025
+          HOP = 256
+          NFFT = 2048
+          targets = {
+              'original_mono': Path('input/audio/original_mono_norm.wav'),
+              'wide_music': Path('input/audio/wide_music_norm.wav'),
+              'side_music': Path('input/audio/side_music_norm.wav'),
+          }
+          candidates = {p.stem: p for p in Path('candidates/wav').glob('*.wav')}
+
+          def load(path):
+              y, _ = librosa.load(path, sr=SR, mono=True)
+              y = librosa.util.normalize(y)
+              return y
+
+          def tempo(y):
+              onset = librosa.onset.onset_strength(y=y, sr=SR, hop_length=HOP)
+              t = librosa.feature.tempo(onset_envelope=onset, sr=SR, hop_length=HOP, aggregate=np.median)
+              return float(np.ravel(t)[0]) if np.size(t) else None
+
+          def local_peaks(y):
+              S = np.abs(librosa.stft(y, n_fft=NFFT, hop_length=HOP, window='hann'))
+              D = librosa.amplitude_to_db(S + 1e-10, ref=np.max)
+              mx = maximum_filter(D, size=(15, 9), mode='nearest')
+              mask = (D == mx) & (D > -42)
+              f, t = np.where(mask)
+              vals = D[f, t]
+              # Keep strongest peaks per roughly half-second bucket.
+              buckets = defaultdict(list)
+              for fi, ti, val in zip(f, t, vals):
+                  buckets[int(ti // 22)].append((float(val), int(fi), int(ti)))
+              peaks=[]
+              for items in buckets.values():
+                  for val, fi, ti in sorted(items, reverse=True)[:12]:
+                      peaks.append((ti, fi))
+              return sorted(peaks)
+
+          def landmark_hashes(y):
+              peaks = local_peaks(y)
+              by_time = defaultdict(list)
+              for ti, fi in peaks:
+                  by_time[ti].append(fi)
+              times = sorted(by_time)
+              hashes=[]
+              for i, t1 in enumerate(times):
+                  for t2 in times[i+1:]:
+                      dt = t2-t1
+                      if dt > 130:
+                          break
+                      if dt < 12:
+                          continue
+                      for f1 in by_time[t1][:8]:
+                          for f2 in by_time[t2][:8]:
+                              # Coarsen slightly for compression/noise robustness.
+                              h=(f1//2, f2//2, dt//2)
+                              hashes.append((h,t1))
+              return hashes
+
+          def landmark_match(query, target):
+              qh = landmark_hashes(query)
+              th = landmark_hashes(target)
+              index=defaultdict(list)
+              for h,t in th:
+                  index[h].append(t)
+              offsets=Counter()
+              shared=0
+              for h,qt in qh:
+                  for tt in index.get(h,[]):
+                      shared += 1
+                      offsets[int(round((tt-qt)/2))] += 1
+              best_offset, best_cluster = (None,0)
+              if offsets:
+                  # Sum neighboring offset bins to allow minor time skew.
+                  for off in offsets:
+                      score=sum(offsets.get(off+d,0) for d in (-2,-1,0,1,2))
+                      if score>best_cluster:
+                          best_offset,best_cluster=off,score
+              return {
+                  'query_hashes': len(qh),
+                  'target_hashes': len(th),
+                  'shared_hash_pairs': shared,
+                  'best_consistent_offset_cluster': best_cluster,
+                  'offset_seconds': None if best_offset is None else best_offset*2*HOP/SR,
+              }
+
+          def norm_cols(X):
+              return librosa.util.normalize(X, axis=0)
+
+          def dtw_best(query, target, seconds=10.0, step=2.0):
+              q_ch = norm_cols(librosa.feature.chroma_cqt(y=librosa.effects.harmonic(query), sr=SR, hop_length=HOP))
+              t_ch = norm_cols(librosa.feature.chroma_cqt(y=librosa.effects.harmonic(target), sr=SR, hop_length=HOP))
+              q_mf = librosa.feature.mfcc(y=query, sr=SR, n_mfcc=20, hop_length=HOP)
+              t_mf = librosa.feature.mfcc(y=target, sr=SR, n_mfcc=20, hop_length=HOP)
+              q_mf = (q_mf - q_mf.mean(axis=1, keepdims=True))/(q_mf.std(axis=1, keepdims=True)+1e-8)
+              t_mf = (t_mf - t_mf.mean(axis=1, keepdims=True))/(t_mf.std(axis=1, keepdims=True)+1e-8)
+              n=max(20,int(seconds*SR/HOP))
+              hop=max(1,int(step*SR/HOP))
+              best={'combined':1e9}
+              for s in range(0,max(1,q_ch.shape[1]-n+1),hop):
+                  Xc=q_ch[:,s:s+n]
+                  Xm=q_mf[:,s:s+n]
+                  if Xc.shape[1] < n*0.8:
+                      continue
+                  Dc,wpc=librosa.sequence.dtw(X=Xc,Y=t_ch,metric='cosine',subseq=True,backtrack=True)
+                  Dm,wpm=librosa.sequence.dtw(X=Xm,Y=t_mf,metric='cosine',subseq=True,backtrack=True)
+                  cc=float(np.min(Dc[-1])/Xc.shape[1])
+                  mc=float(np.min(Dm[-1])/Xm.shape[1])
+                  comb=0.65*cc+0.35*mc
+                  if comb<best['combined']:
+                      endc=int(np.argmin(Dc[-1]))
+                      best={
+                          'candidate_start_seconds': s*HOP/SR,
+                          'target_end_seconds': endc*HOP/SR,
+                          'chroma_cost_lower_is_better': cc,
+                          'mfcc_cost_lower_is_better': mc,
+                          'combined': comb,
+                      }
+              return best
+
+          loaded_targets={k:load(p) for k,p in targets.items()}
+          loaded_candidates={k:load(p) for k,p in candidates.items()}
+          report={'target_tempos':{k:tempo(y) for k,y in loaded_targets.items()},'candidates':{}}
+          rows=[]
+          for cname,cy in loaded_candidates.items():
+              cdata={'tempo_bpm':tempo(cy),'targets':{}}
+              for tname,ty in loaded_targets.items():
+                  lm=landmark_match(cy,ty)
+                  dtw=dtw_best(cy,ty)
+                  item={'landmark':lm,'dtw':dtw}
+                  cdata['targets'][tname]=item
+                  rows.append({
+                      'candidate':cname,
+                      'target':tname,
+                      'candidate_tempo_bpm':cdata['tempo_bpm'],
+                      'target_tempo_bpm':report['target_tempos'][tname],
+                      'landmark_offset_cluster':lm['best_consistent_offset_cluster'],
+                      'landmark_shared_pairs':lm['shared_hash_pairs'],
+                      'dtw_combined_lower_is_better':dtw['combined'],
+                      'dtw_chroma_lower_is_better':dtw['chroma_cost_lower_is_better'],
+                      'dtw_mfcc_lower_is_better':dtw['mfcc_cost_lower_is_better'],
+                      'candidate_start_seconds':dtw['candidate_start_seconds'],
+                      'target_end_seconds':dtw['target_end_seconds'],
+                  })
+              report['candidates'][cname]=cdata
+          rows.sort(key=lambda r:(-r['landmark_offset_cluster'],r['dtw_combined_lower_is_better']))
+          Path('results/validation_report.json').write_text(json.dumps(report,indent=2))
+          Path('results/validation_ranked.json').write_text(json.dumps(rows,indent=2))
+          cols=list(rows[0])
+          with Path('results/validation_ranked.tsv').open('w') as f:
+              f.write('\t'.join(cols)+'\n')
+              for r in rows:
+                  f.write('\t'.join(str(r[c]) for c in cols)+'\n')
+          print(json.dumps(rows,indent=2))
+          PY
+          python compare.py | tee results/validation_console.txt
+
+      - name: Re-identify catalog previews
+        shell: bash
+        run: |
+          set -u
+          : > results/preview_audd.tsv
+          for file in candidates/wav/*.wav; do
+            base="$(basename "$file" .wav)"
+            curl -sS --max-time 90 -F api_token=test -F "file=@${file}" https://api.audd.io/ > "results/${base}_audd.json" || true
+            printf '%s\t%s\t%s\n' "$base" \
+              "$(jq -r '.result.artist // empty' "results/${base}_audd.json" 2>/dev/null || true)" \
+              "$(jq -r '.result.title // empty' "results/${base}_audd.json" 2>/dev/null || true)" >> results/preview_audd.tsv
+          done
+          cat results/preview_audd.tsv
+
+      - name: Upload validation evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: bad-friends-candidate-validation
+          path: |
+            results/
+            candidates/wav/
+          if-no-files-found: error
+          retention-days: 1
