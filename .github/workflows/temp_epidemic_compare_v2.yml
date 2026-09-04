@@ -1,0 +1,201 @@
+name: Temporary corrected Epidemic montage comparison
+
+"on":
+  push:
+    branches:
+      - temp-epidemic-probe-bad-friends-20260904
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Download isolated montage music
+        uses: actions/download-artifact@v4
+        with:
+          name: bad-friends-demucs-identification
+          path: input
+          github-token: ${{ github.token }}
+          repository: marcboyertime/OptionsScout
+          run-id: 33841219671
+
+      - name: Install tools
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          python -m pip install --upgrade "numpy<3" scipy librosa soundfile requests shazamio==0.8.1
+          mkdir -p catalog previews results
+
+      - name: Download relevant pre-episode Epidemic tracks
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cat > candidates.py <<'PY'
+          import json,time
+          from pathlib import Path
+          from datetime import datetime,timezone
+          import requests
+          terms=['retro','synthwave','80s','disco','synth','comedy','quirky']
+          cutoff=datetime(2020,6,29,tzinfo=timezone.utc)
+          s=requests.Session();s.headers['User-Agent']='Mozilla/5.0'
+          tracks={}
+          for term in terms:
+              r=s.get('https://www.epidemicsound.com/json/search/tracks/',params={'limit':100,'page':1,'term':term,'order':'desc','sort':'relevance'},timeout=60)
+              r.raise_for_status(); data=r.json(); Path(f'catalog/{term}.json').write_text(json.dumps(data))
+              for tid,t in data.get('entities',{}).get('tracks',{}).items():
+                  try:
+                      ad=datetime.fromisoformat((t.get('added') or '').replace('Z','+00:00'))
+                      if ad.tzinfo is None: ad=ad.replace(tzinfo=timezone.utc)
+                  except Exception: continue
+                  bpm=float(t.get('bpm') or 0)
+                  if ad<=cutoff and 117<=bpm<=129:
+                      if tid not in tracks: tracks[tid]=t|{'_terms':[term]}
+                      elif term not in tracks[tid]['_terms']: tracks[tid]['_terms'].append(term)
+          rows=[]
+          for tid,t in tracks.items():
+              url=(((t.get('stems') or {}).get('full') or {}).get('lqMp3Url'))
+              if not url: continue
+              artists=[a.get('name') if isinstance(a,dict) else str(a) for a in (((t.get('creatives') or {}).get('mainArtists')) or [])]
+              rows.append({'id':tid,'title':t.get('title'),'artists':artists,'bpm':t.get('bpm'),'added':t.get('added'),'releaseDate':t.get('releaseDate'),'genres':t.get('genres'),'moods':t.get('moods'),'url':url,'terms':t['_terms'],'publicSlug':t.get('publicSlug'),'kosmosId':t.get('kosmosId'),'isrc':t.get('isrc')})
+          rows.sort(key=lambda r:(abs(float(r['bpm'])-123.046875),r['added']))
+          Path('results/candidates.json').write_text(json.dumps(rows,indent=2,ensure_ascii=False))
+          print('CANDIDATES',len(rows))
+          for i,r in enumerate(rows):
+              p=Path('previews')/f'{i:03d}_{r["id"]}.mp3'
+              q=s.get(r['url'],timeout=90);q.raise_for_status();p.write_bytes(q.content)
+              print(i,r['title'],r['artists'],r['bpm'],len(q.content));time.sleep(.08)
+          PY
+          python candidates.py | tee results/candidates_console.txt
+
+      - name: Compute phase-sensitive and structural matches
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cat > match.py <<'PY'
+          import json
+          from pathlib import Path
+          import numpy as np
+          import librosa
+          from scipy.signal import fftconvolve
+
+          SR=11025; HOP=256
+          target_path=next(Path('input').rglob('montage_no_dialogue.mp3'))
+          meta=json.loads(Path('results/candidates.json').read_text())
+
+          def load(p):
+              y,_=librosa.load(p,sr=SR,mono=True)
+              y=np.nan_to_num(y).astype(np.float64)
+              y=librosa.effects.preemphasis(y)
+              return y
+          target=load(target_path)
+
+          def sliding_ncc(signal,query):
+              q=query-query.mean(); qn=np.linalg.norm(q)+1e-12
+              x=signal
+              n=len(q)
+              num=fftconvolve(x,q[::-1],mode='valid')
+              ss=fftconvolve(x*x,np.ones(n),mode='valid')
+              sm=fftconvolve(x,np.ones(n),mode='valid')
+              var=np.maximum(ss-sm*sm/n,1e-12)
+              z=num/(qn*np.sqrt(var))
+              i=int(np.argmax(np.abs(z)))
+              return float(abs(z[i])),i/SR,float(z[i])
+
+          def chunks_match(c):
+              scores=[]
+              for start in np.arange(0,max(0,len(target)/SR-8)+.01,4):
+                  q=target[int(start*SR):int((start+8)*SR)]
+                  if len(q)<7.5*SR: continue
+                  sc,off,signed=sliding_ncc(c,q)
+                  scores.append({'target_start':float(start),'candidate_start':off,'ncc':sc,'signed':signed,'relative_offset':off-float(start)})
+              top=sorted(scores,key=lambda x:x['ncc'],reverse=True)
+              # Same recording should show many strong chunks with a stable relative offset.
+              strong=[x for x in scores if x['ncc']>=.08]
+              if strong:
+                  rel=np.array([x['relative_offset'] for x in strong])
+                  med=float(np.median(rel)); consistent=sum(abs(rel-med)<1.0)
+              else: med=None; consistent=0
+              return scores,top[:6],consistent,med
+
+          def structural(c):
+              tm=librosa.feature.mfcc(y=target,sr=SR,n_mfcc=20,hop_length=HOP)
+              cm=librosa.feature.mfcc(y=c,sr=SR,n_mfcc=20,hop_length=HOP)
+              tm=(tm-tm.mean(1,keepdims=True))/(tm.std(1,keepdims=True)+1e-8)
+              cm=(cm-cm.mean(1,keepdims=True))/(cm.std(1,keepdims=True)+1e-8)
+              tc=librosa.feature.chroma_cqt(y=target,sr=SR,hop_length=HOP); tc/=np.linalg.norm(tc,axis=0,keepdims=True)+1e-9
+              cc=librosa.feature.chroma_cqt(y=c,sr=SR,hop_length=HOP); cc/=np.linalg.norm(cc,axis=0,keepdims=True)+1e-9
+              win=int(8*SR/HOP); vals=[]
+              for st in range(0,max(1,tm.shape[1]-win+1),int(4*SR/HOP)):
+                  Dm,_=librosa.sequence.dtw(X=tm[:,st:st+win],Y=cm,metric='cosine',subseq=True,backtrack=True)
+                  Dc,_=librosa.sequence.dtw(X=tc[:,st:st+win],Y=cc,metric='cosine',subseq=True,backtrack=True)
+                  vals.append((float(np.min(Dm[-1])/win),float(np.min(Dc[-1])/win),st*HOP/SR))
+              vals.sort(key=lambda x:.7*x[0]+.3*x[1])
+              b=vals[:5]
+              return float(np.mean([x[0] for x in b])),float(np.mean([x[1] for x in b])),[x[2] for x in b]
+
+          rows=[]
+          for i,r in enumerate(meta):
+              p=next(Path('previews').glob(f'{i:03d}_*.mp3')); c=load(p)
+              allc,top,consistent,med=chunks_match(c)
+              mfcc,chroma,bwins=structural(c)
+              nccs=[x['ncc'] for x in allc]
+              item=r|{'file':str(p),'top_ncc':max(nccs) if nccs else 0,'mean_top4_ncc':float(np.mean(sorted(nccs,reverse=True)[:4])) if nccs else 0,'chunks_over_008':sum(v>=.08 for v in nccs),'chunks_over_012':sum(v>=.12 for v in nccs),'consistent_offset_chunks':consistent,'median_relative_offset':med,'top_chunk_matches':top,'mfcc_cost':mfcc,'chroma_cost':chroma,'best_structural_windows':bwins}
+              item['score']=item['mean_top4_ncc']*100+item['consistent_offset_chunks']*2+item['chunks_over_012']*3-mfcc*2-chroma
+              rows.append(item)
+              print(i,r['title'],'TOP',item['top_ncc'],'AVG4',item['mean_top4_ncc'],'CONS',consistent,'MFCC',mfcc,'SCORE',item['score'])
+          rows.sort(key=lambda x:x['score'],reverse=True)
+          Path('results/ranked.json').write_text(json.dumps(rows,indent=2,ensure_ascii=False))
+          Path('results/ranked.tsv').write_text('title\tartists\tbpm\tadded\ttop_ncc\tmean_top4_ncc\tchunks_over_008\tchunks_over_012\tconsistent_offset_chunks\tmfcc_cost\tchroma_cost\tscore\turl\n'+'\n'.join('\t'.join(str(r.get(k,'')) for k in ['title','artists','bpm','added','top_ncc','mean_top4_ncc','chunks_over_008','chunks_over_012','consistent_offset_chunks','mfcc_cost','chroma_cost','score','url']) for r in rows))
+          print('TOP15')
+          for r in rows[:15]: print(json.dumps({k:r[k] for k in ['title','artists','bpm','added','top_ncc','mean_top4_ncc','chunks_over_008','chunks_over_012','consistent_offset_chunks','median_relative_offset','mfcc_cost','chroma_cost','score']},ensure_ascii=False))
+          PY
+          python match.py | tee results/match_console.txt
+
+      - name: Ask Shazam about every catalog preview
+        shell: bash
+        run: |
+          set -u
+          cat > recognize.py <<'PY'
+          import asyncio,json
+          from pathlib import Path
+          from shazamio import Shazam
+          rows=json.loads(Path('results/ranked.json').read_text())
+          async def main():
+              out=[]
+              sh=Shazam()
+              for r in rows:
+                  try:
+                      z=await sh.recognize(r['file']);t=z.get('track') or {}
+                      out.append({'epidemic_title':r['title'],'epidemic_artists':r['artists'],'score':r['score'],'shazam_title':t.get('title'),'shazam_artist':t.get('subtitle'),'shazam_key':t.get('key'),'shazam_isrc':t.get('isrc'),'match_count':len(z.get('matches') or [])})
+                  except Exception as e: out.append({'epidemic_title':r['title'],'error':repr(e)})
+                  await asyncio.sleep(.35)
+              Path('results/catalog_shazam.json').write_text(json.dumps(out,indent=2,ensure_ascii=False))
+              print(json.dumps(out,indent=2,ensure_ascii=False))
+          asyncio.run(main())
+          PY
+          python recognize.py | tee results/catalog_shazam_console.txt || true
+
+      - name: Preserve highest-ranked previews
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json,shutil
+          from pathlib import Path
+          rows=json.loads(Path('results/ranked.json').read_text()); out=Path('results/top_previews');out.mkdir(exist_ok=True)
+          for i,r in enumerate(rows[:12]):
+              safe=''.join(c if c.isalnum() or c in ' -_' else '_' for c in r['title'])[:70]
+              shutil.copy2(r['file'],out/f'{i+1:02d}_{safe}.mp3')
+          PY
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: corrected-epidemic-candidate-comparison
+          path: results/
+          if-no-files-found: error
+          retention-days: 1
