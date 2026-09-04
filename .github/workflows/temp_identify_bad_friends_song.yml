@@ -1,0 +1,191 @@
+name: Temporary identify Bad Friends montage music
+
+"on":
+  push:
+    branches:
+      - temp-identify-bad-friends-song-20260904
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  identify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Download previously recovered YouTube segment
+        uses: actions/download-artifact@v4
+        with:
+          name: actual-youtube-segment-canine
+          path: input
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: marcboyertime/OptionsScout
+          run-id: 33839729403
+
+      - name: Prepare recognition tools
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg curl jq
+          python -m pip install --upgrade shazamio==0.8.1
+          find input -maxdepth 3 -type f -printf '%p %s bytes\n'
+
+      - name: Extract exact montage and recognition variants
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p audio/windows results
+          source_file="$(find input -type f -name 'review.mp4' | head -n 1)"
+          test -n "$source_file"
+
+          # review.mp4 begins at 38:00 of the YouTube upload. The verified montage
+          # runs at 40:20.5-41:32.5, i.e. 140.5-212.5 seconds into review.mp4.
+          ffmpeg -hide_banner -loglevel error -y \
+            -ss 140.5 -i "$source_file" -t 72 \
+            -vn -map_metadata -1 -ac 2 -ar 44100 -c:a pcm_s16le \
+            audio/original_stereo.wav
+
+          ffmpeg -hide_banner -loglevel error -y \
+            -i audio/original_stereo.wav \
+            -af "pan=mono|c0=0.5*FL+0.5*FR,loudnorm=I=-16:TP=-1.5:LRA=11" \
+            -ar 44100 -c:a pcm_s16le audio/original_mono_norm.wav
+
+          # Side-channel extraction suppresses centered speech and emphasizes
+          # stereo background music.
+          ffmpeg -hide_banner -loglevel error -y \
+            -i audio/original_stereo.wav \
+            -af "pan=mono|c0=FL-FR,highpass=f=70,lowpass=f=15500,loudnorm=I=-16:TP=-1.5:LRA=11" \
+            -ar 44100 -c:a pcm_s16le audio/side_music_norm.wav
+
+          # A less aggressive side extraction can retain music shared between channels.
+          ffmpeg -hide_banner -loglevel error -y \
+            -i audio/original_stereo.wav \
+            -af "stereotools=mlev=0.25:slev=1.75,pan=mono|c0=0.5*FL+0.5*FR,highpass=f=60,lowpass=f=16000,loudnorm=I=-16:TP=-1.5:LRA=11" \
+            -ar 44100 -c:a pcm_s16le audio/wide_music_norm.wav
+
+          for variant in original_stereo original_mono_norm side_music_norm wide_music_norm; do
+            for start in 0 4 8 12 16 20 24 28 32 36 40 44 48 52 56 60; do
+              ffmpeg -hide_banner -loglevel error -y \
+                -ss "$start" -i "audio/${variant}.wav" -t 12 \
+                -ar 44100 -c:a pcm_s16le \
+                "audio/windows/${variant}_${start}s.wav"
+            done
+          done
+
+          ffprobe -v error -show_entries format=duration,size \
+            -of default=noprint_wrappers=1 audio/original_stereo.wav
+
+      - name: Run Shazam fingerprint recognition on overlapping windows
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cat > recognize_shazam.py <<'PY'
+          import asyncio
+          import json
+          import pathlib
+          import traceback
+          from collections import Counter
+          from shazamio import Shazam
+
+          AUDIO = pathlib.Path('audio')
+          RESULTS = pathlib.Path('results')
+          RESULTS.mkdir(exist_ok=True)
+
+          files = [
+              AUDIO / 'original_stereo.wav',
+              AUDIO / 'original_mono_norm.wav',
+              AUDIO / 'side_music_norm.wav',
+              AUDIO / 'wide_music_norm.wav',
+          ] + sorted((AUDIO / 'windows').glob('*.wav'))
+
+          async def main():
+              shazam = Shazam()
+              rows = []
+              raw = {}
+              for index, path in enumerate(files, 1):
+                  try:
+                      response = await shazam.recognize(str(path))
+                      raw[str(path)] = response
+                      track = response.get('track') or {}
+                      rows.append({
+                          'file': str(path),
+                          'title': track.get('title'),
+                          'artist': track.get('subtitle'),
+                          'shazam_key': track.get('key'),
+                          'url': track.get('url'),
+                          'match_count': len(response.get('matches') or []),
+                      })
+                      print(index, path, '=>', track.get('title'), '/', track.get('subtitle'), flush=True)
+                  except Exception as exc:
+                      raw[str(path)] = {'exception': repr(exc), 'traceback': traceback.format_exc()}
+                      rows.append({'file': str(path), 'error': repr(exc)})
+                      print(index, path, 'ERROR', repr(exc), flush=True)
+                  await asyncio.sleep(0.35)
+
+              (RESULTS / 'shazam_raw.json').write_text(json.dumps(raw, indent=2, ensure_ascii=False))
+              (RESULTS / 'shazam_rows.json').write_text(json.dumps(rows, indent=2, ensure_ascii=False))
+
+              counts = Counter(
+                  (r.get('title'), r.get('artist'), r.get('shazam_key'))
+                  for r in rows if r.get('title')
+              )
+              summary = []
+              for (title, artist, key), count in counts.most_common():
+                  examples = [r['file'] for r in rows if (r.get('title'), r.get('artist'), r.get('shazam_key')) == (title, artist, key)]
+                  summary.append({'title': title, 'artist': artist, 'shazam_key': key, 'recognitions': count, 'files': examples})
+              (RESULTS / 'shazam_summary.json').write_text(json.dumps(summary, indent=2, ensure_ascii=False))
+              print('SUMMARY', json.dumps(summary, indent=2, ensure_ascii=False))
+
+          asyncio.run(main())
+          PY
+          python recognize_shazam.py | tee results/shazam_console.txt
+
+      - name: Run AudD recognition using the public demo token
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -u
+          mkdir -p results/audd
+          candidates=(
+            audio/windows/original_stereo_4s.wav
+            audio/windows/original_stereo_16s.wav
+            audio/windows/original_stereo_28s.wav
+            audio/windows/original_stereo_40s.wav
+            audio/windows/original_stereo_52s.wav
+            audio/windows/side_music_norm_4s.wav
+            audio/windows/side_music_norm_16s.wav
+            audio/windows/side_music_norm_28s.wav
+            audio/windows/side_music_norm_40s.wav
+            audio/windows/side_music_norm_52s.wav
+          )
+          : > results/audd_summary.tsv
+          for clip in "${candidates[@]}"; do
+            base="$(basename "$clip" .wav)"
+            echo "Recognizing $clip"
+            curl -sS --max-time 90 \
+              -F api_token=test \
+              -F return=spotify,apple_music \
+              -F "file=@${clip}" \
+              https://api.audd.io/ > "results/audd/${base}.json" || true
+            status="$(jq -r '.status // empty' "results/audd/${base}.json" 2>/dev/null || true)"
+            artist="$(jq -r '.result.artist // empty' "results/audd/${base}.json" 2>/dev/null || true)"
+            title="$(jq -r '.result.title // empty' "results/audd/${base}.json" 2>/dev/null || true)"
+            printf '%s\t%s\t%s\t%s\n' "$base" "$status" "$artist" "$title" >> results/audd_summary.tsv
+            cat "results/audd/${base}.json"
+            echo
+          done
+
+      - name: Upload recognition evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: bad-friends-montage-recognition-results
+          path: |
+            results/
+            audio/original_stereo.wav
+            audio/original_mono_norm.wav
+            audio/side_music_norm.wav
+            audio/wide_music_norm.wav
+          if-no-files-found: error
+          retention-days: 1
