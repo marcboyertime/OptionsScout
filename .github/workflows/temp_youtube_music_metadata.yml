@@ -1,0 +1,147 @@
+name: Temporary inspect YouTube music metadata
+
+"on":
+  push:
+    branches:
+      - temp-youtube-page-music-metadata-20260904
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Install browser
+        shell: bash
+        run: |
+          set -euxo pipefail
+          npm init -y
+          npm install playwright
+          npx playwright install --with-deps chromium
+          mkdir -p results
+
+      - name: Inspect watch page, structured description, and comments
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cat > inspect.js <<'JS'
+          const { chromium } = require('playwright');
+          const fs = require('fs');
+          const out = 'results';
+          const VIDEO_ID = '730p91Qiuig';
+          const url = `https://www.youtube.com/watch?v=${VIDEO_ID}`;
+          const responses = [];
+          const logs = [];
+          const save = (name, data) => fs.writeFileSync(`${out}/${name}`, typeof data === 'string' ? data : JSON.stringify(data, null, 2));
+          const walk = (obj, path=[], hits=[]) => {
+            if (obj == null) return hits;
+            if (typeof obj === 'string') {
+              if (/music|song|artist|track|license|licensed|provided to youtube|epidemic|audio library|soundstripe|artlist|sunset|nick off/i.test(obj)) {
+                hits.push({path:path.join('.'), value:obj.slice(0,2000)});
+              }
+              return hits;
+            }
+            if (Array.isArray(obj)) obj.forEach((v,i)=>walk(v,path.concat(i),hits));
+            else if (typeof obj === 'object') Object.entries(obj).forEach(([k,v])=>{
+              if (/music|song|artist|track|license/i.test(k)) hits.push({path:path.concat(k).join('.'), value:typeof v==='string'?v.slice(0,2000):JSON.stringify(v).slice(0,4000)});
+              walk(v,path.concat(k),hits);
+            });
+            return hits;
+          };
+
+          (async()=>{
+            const browser = await chromium.launch({headless:true,args:['--no-sandbox','--disable-dev-shm-usage','--autoplay-policy=no-user-gesture-required']});
+            const context = await browser.newContext({
+              viewport:{width:1440,height:1200},
+              locale:'en-US',
+              userAgent:'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36'
+            });
+            const page = await context.newPage();
+            page.on('console',m=>logs.push(`${m.type()}: ${m.text()}`));
+            page.on('response', async r=>{
+              const u=r.url(); const ct=r.headers()['content-type']||'';
+              if (/youtubei\/v1\/(next|player)|watch\?v=|get_transcript|comment/i.test(u)) {
+                let body=''; try{body=(await r.text()).slice(0,5000000);}catch{}
+                responses.push({url:u,status:r.status(),contentType:ct,body});
+              }
+            });
+            try {
+              await page.goto(url,{waitUntil:'domcontentloaded',timeout:120000});
+              await page.waitForTimeout(10000);
+              // Consent buttons if present.
+              for (const re of [/accept all/i,/reject all/i,/agree/i,/no thanks/i]) {
+                const b=page.getByRole('button',{name:re}).first();
+                if(await b.isVisible().catch(()=>false)){await b.click().catch(()=>{});await page.waitForTimeout(3000);break;}
+              }
+              // Expand description.
+              for (const sel of ['#description-inline-expander tp-yt-paper-button#expand','#description-inline-expander #expand','#description #expand','tp-yt-paper-button#expand']) {
+                const el=page.locator(sel).first();
+                if(await el.isVisible().catch(()=>false)){await el.click().catch(()=>{});await page.waitForTimeout(3000);break;}
+              }
+              // Scroll through description and comments to trigger lazy data.
+              await page.evaluate(()=>window.scrollTo(0,900)); await page.waitForTimeout(5000);
+              await page.evaluate(()=>window.scrollTo(0,1800)); await page.waitForTimeout(5000);
+              await page.evaluate(()=>window.scrollTo(0,3500)); await page.waitForTimeout(7000);
+              await page.evaluate(()=>window.scrollTo(0,6500)); await page.waitForTimeout(7000);
+
+              const body=await page.locator('body').innerText().catch(()=> '');
+              const html=await page.content();
+              save('page_body.txt',body);
+              save('page.html',html);
+              await page.screenshot({path:`${out}/page.png`,fullPage:true}).catch(()=>{});
+
+              const globals=await page.evaluate(()=>{
+                const copy=(x)=>{try{return JSON.parse(JSON.stringify(x));}catch{return null;}};
+                return {
+                  ytInitialPlayerResponse: copy(window.ytInitialPlayerResponse),
+                  ytInitialData: copy(window.ytInitialData),
+                  ytplayerConfig: copy(window.ytplayer?.config),
+                };
+              });
+              save('globals.json',globals);
+              save('global_music_hits.json',walk(globals));
+              save('responses.json',responses);
+              const responseHits=[];
+              for(const r of responses){
+                if(!r.body) continue;
+                let parsed=null; try{parsed=JSON.parse(r.body);}catch{}
+                if(parsed) responseHits.push(...walk(parsed,[r.url]));
+                else if(/music|song|artist|license|provided to youtube|epidemic|sunset|nick off/i.test(r.body)) responseHits.push({path:r.url,value:r.body.slice(0,100000)});
+              }
+              save('response_music_hits.json',responseHits);
+
+              // Capture visible description-specific text.
+              const descSelectors=['#description-inline-expander','#description','#structured-description','#info-container','ytd-watch-metadata'];
+              const desc={};
+              for(const s of descSelectors){desc[s]=await page.locator(s).first().innerText().catch(()=> '');}
+              save('description_sections.json',desc);
+
+              // Search rendered text around any likely music labels.
+              const lines=body.split('\n');
+              const contexts=[];
+              lines.forEach((line,i)=>{if(/music|song|artist|license|licensed|provided to youtube|epidemic|artlist|audio library|sunset|nick off/i.test(line)) contexts.push(lines.slice(Math.max(0,i-6),Math.min(lines.length,i+12)).join('\n'));});
+              save('visible_music_contexts.txt',contexts.join('\n\n---\n\n'));
+              save('console.txt',logs.join('\n'));
+            } catch(e){save('fatal.txt',e.stack||String(e));}
+            await browser.close();
+          })();
+          JS
+          node inspect.js
+
+      - name: Summarize likely attribution strings
+        shell: bash
+        run: |
+          set -euxo pipefail
+          grep -RniE 'music|song|artist|license|licensed|provided to youtube|epidemic|artlist|audio library|sunset|nick off' results \
+            --include='*.txt' --include='*.json' > results/grep_hits.txt || true
+          head -n 1000 results/grep_hits.txt || true
+
+      - name: Upload page evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: youtube-page-music-metadata
+          path: results/
+          if-no-files-found: error
+          retention-days: 1
