@@ -1,0 +1,123 @@
+name: Temporary fast Epidemic exact match
+
+"on":
+  push:
+    branches:
+      - temp-fast-epidemic-match-20260904
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  match:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Download isolated music stem
+        uses: actions/download-artifact@v4
+        with:
+          name: bad-friends-demucs-identification
+          path: input
+          github-token: ${{ github.token }}
+          repository: marcboyertime/OptionsScout
+          run-id: 33841219671
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          python -m pip install --upgrade "numpy<3" scipy librosa requests shazamio==0.8.1
+          mkdir -p previews results
+
+      - name: Download candidates and exact-match them
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cat > fast.py <<'PY'
+          import asyncio,json,time
+          from pathlib import Path
+          from datetime import datetime,timezone
+          import numpy as np
+          import requests,librosa
+          from scipy.signal import fftconvolve
+          from shazamio import Shazam
+
+          SR=8000
+          cutoff=datetime(2020,6,29,tzinfo=timezone.utc)
+          terms=['retro','synthwave','80s','disco','synth','comedy','quirky']
+          session=requests.Session();session.headers['User-Agent']='Mozilla/5.0'
+          tracks={}
+          for term in terms:
+              data=session.get('https://www.epidemicsound.com/json/search/tracks/',params={'limit':100,'page':1,'term':term,'order':'desc','sort':'relevance'},timeout=60).json()
+              for tid,t in data.get('entities',{}).get('tracks',{}).items():
+                  try:
+                      dt=datetime.fromisoformat((t.get('added') or '').replace('Z','+00:00'))
+                      if dt.tzinfo is None:dt=dt.replace(tzinfo=timezone.utc)
+                  except:continue
+                  bpm=float(t.get('bpm') or 0)
+                  url=(((t.get('stems') or {}).get('full') or {}).get('lqMp3Url'))
+                  if dt<=cutoff and 117<=bpm<=129 and url:tracks.setdefault(tid,t)
+          rows=[]
+          for i,(tid,t) in enumerate(tracks.items()):
+              p=Path('previews')/f'{i:03d}_{tid}.mp3';p.write_bytes(session.get((((t.get('stems') or {}).get('full') or {}).get('lqMp3Url')),timeout=90).content)
+              rows.append({'id':tid,'title':t.get('title'),'artists':[a.get('name') for a in (((t.get('creatives') or {}).get('mainArtists')) or []) if isinstance(a,dict)],'bpm':t.get('bpm'),'added':t.get('added'),'url':(((t.get('stems') or {}).get('full') or {}).get('lqMp3Url')),'file':str(p),'publicSlug':t.get('publicSlug'),'isrc':t.get('isrc')})
+          print('candidate count',len(rows))
+          target_path=next(Path('input').rglob('montage_no_dialogue.mp3'))
+          target,_=librosa.load(target_path,sr=SR,mono=True); target=librosa.effects.preemphasis(target.astype(float))
+
+          def ncc(x,q):
+              q=q-q.mean();qn=np.linalg.norm(q)+1e-10;n=len(q)
+              num=fftconvolve(x,q[::-1],mode='valid');ss=fftconvolve(x*x,np.ones(n),mode='valid');sm=fftconvolve(x,np.ones(n),mode='valid')
+              z=num/(qn*np.sqrt(np.maximum(ss-sm*sm/n,1e-10)));j=int(np.argmax(np.abs(z)))
+              return float(abs(z[j])),j/SR
+
+          for r in rows:
+              c,_=librosa.load(r['file'],sr=SR,mono=True);c=librosa.effects.preemphasis(c.astype(float))
+              matches=[]
+              for st in range(0,65,4):
+                  q=target[st*SR:(st+7)*SR]
+                  if len(q)<7*SR:continue
+                  sc,off=ncc(c,q);matches.append((sc,st,off,off-st))
+              matches.sort(reverse=True)
+              r['best_ncc']=matches[0][0];r['mean_top5_ncc']=float(np.mean([m[0] for m in matches[:5]]));r['matches']=matches[:8]
+              rel=[m[3] for m in matches if m[0]>=.08]
+              if rel:
+                  med=float(np.median(rel));r['consistent_offsets']=sum(abs(v-med)<.75 for v in rel);r['relative_offset']=med
+              else:r['consistent_offsets']=0;r['relative_offset']=None
+              r['exact_score']=r['mean_top5_ncc']*100+r['consistent_offsets']*4
+              print(r['title'],r['best_ncc'],r['mean_top5_ncc'],r['consistent_offsets'],r['exact_score'])
+          rows.sort(key=lambda x:x['exact_score'],reverse=True)
+
+          async def recognize_top():
+              sh=Shazam()
+              for r in rows:
+                  try:
+                      z=await sh.recognize(r['file']);t=z.get('track') or {}
+                      r['shazam_title']=t.get('title');r['shazam_artist']=t.get('subtitle');r['shazam_key']=t.get('key');r['shazam_isrc']=t.get('isrc')
+                  except Exception as e:r['shazam_error']=repr(e)
+                  await asyncio.sleep(.25)
+          asyncio.run(recognize_top())
+          Path('results/ranked.json').write_text(json.dumps(rows,indent=2,ensure_ascii=False))
+          Path('results/ranked.tsv').write_text('title\tartists\tbpm\tadded\tbest_ncc\tmean_top5_ncc\tconsistent_offsets\texact_score\tshazam_title\tshazam_artist\turl\n'+'\n'.join('\t'.join(str(r.get(k,'')) for k in ['title','artists','bpm','added','best_ncc','mean_top5_ncc','consistent_offsets','exact_score','shazam_title','shazam_artist','url']) for r in rows))
+          print('TOP')
+          for r in rows[:12]:print(json.dumps(r,ensure_ascii=False))
+          PY
+          python fast.py | tee results/console.txt
+
+      - name: Preserve previews and upload
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json,shutil
+          from pathlib import Path
+          rows=json.loads(Path('results/ranked.json').read_text());o=Path('results/top_previews');o.mkdir(exist_ok=True)
+          for i,r in enumerate(rows[:12]):shutil.copy2(r['file'],o/f'{i+1:02d}_{r["title"].replace("/","_")}.mp3')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fast-epidemic-exact-match
+          path: results/
+          retention-days: 1
