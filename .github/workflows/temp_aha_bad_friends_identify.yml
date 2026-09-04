@@ -1,0 +1,176 @@
+name: Temporary AHA identify Bad Friends montage
+
+"on":
+  push:
+    branches:
+      - temp-identify-bad-friends-song-20260904
+    paths:
+      - .github/workflows/temp_aha_bad_friends_identify.yml
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  identify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Download separated montage artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: bad-friends-demucs-identification
+          path: input
+          github-token: ${{ github.token }}
+          repository: marcboyertime/OptionsScout
+          run-id: 33841219671
+
+      - name: Prepare clean 30-second query clips
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg xvfb
+          source_file="$(find input -type f -name montage_no_dialogue.mp3 | head -n 1)"
+          test -n "$source_file"
+          mkdir -p clips results
+          ffmpeg -hide_banner -loglevel error -y -ss 0  -t 30 -i "$source_file" -ac 1 -ar 44100 clips/music_00s-30s.mp3
+          ffmpeg -hide_banner -loglevel error -y -ss 18 -t 30 -i "$source_file" -ac 1 -ar 44100 clips/music_18s-48s.mp3
+          ffmpeg -hide_banner -loglevel error -y -ss 30 -t 30 -i "$source_file" -ac 1 -ar 44100 clips/music_30s-60s.mp3
+          ffmpeg -hide_banner -loglevel error -y -ss 42 -t 30 -i "$source_file" -ac 1 -ar 44100 clips/music_42s-72s.mp3
+          ls -lh clips
+
+      - name: Install browser automation
+        shell: bash
+        run: |
+          set -euxo pipefail
+          npm init -y
+          npm install playwright@1.55.0
+          npx playwright install --with-deps chromium
+
+      - name: Upload each clip to AHA Music and capture results
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cat > aha.js <<'JS'
+          const { chromium } = require('playwright');
+          const fs = require('fs');
+          const path = require('path');
+
+          const clips = fs.readdirSync('clips').filter(x => x.endsWith('.mp3')).sort();
+
+          async function clickTurnstile(page) {
+            for (let attempt = 0; attempt < 12; attempt++) {
+              for (const frame of page.frames()) {
+                try {
+                  const checkbox = frame.locator('input[type="checkbox"]');
+                  if (await checkbox.count()) {
+                    await checkbox.first().click({ timeout: 2500, force: true }).catch(()=>{});
+                  }
+                  const body = frame.locator('body');
+                  if ((frame.url().includes('challenges.cloudflare.com') || frame.url().includes('turnstile')) && await body.count()) {
+                    const box = await body.boundingBox().catch(()=>null);
+                    if (box) await page.mouse.click(box.x + Math.min(35, box.width/2), box.y + Math.min(35, box.height/2)).catch(()=>{});
+                  }
+                } catch (_) {}
+              }
+              const upload = page.locator('input[type="file"]');
+              if (await upload.count()) return true;
+              await page.getByText(/click once to verify/i).click({ timeout: 1000 }).catch(()=>{});
+              await page.waitForTimeout(1500);
+            }
+            return false;
+          }
+
+          async function runClip(browser, clip) {
+            const context = await browser.newContext({
+              viewport: { width: 1440, height: 1200 },
+              userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36',
+              locale: 'en-US'
+            });
+            const page = await context.newPage();
+            const events = [];
+            page.on('console', m => events.push({kind:'console', type:m.type(), text:m.text()}));
+            page.on('response', async r => {
+              const u = r.url();
+              const type = r.request().resourceType();
+              if (['xhr','fetch'].includes(type) || /upload|recogn|identify|result|acr|doreso/i.test(u)) {
+                let text = '';
+                try { text = await r.text(); } catch (_) {}
+                if (text.length > 50000) text = text.slice(0,50000);
+                events.push({kind:'response', status:r.status(), url:u, text});
+              }
+            });
+            page.on('requestfailed', r => events.push({kind:'requestfailed', url:r.url(), error:r.failure()}));
+
+            const stem = path.basename(clip, '.mp3');
+            await page.goto('https://aha-music.com/upload', {waitUntil:'domcontentloaded', timeout:90000});
+            await page.waitForTimeout(5000);
+            await page.screenshot({path:`results/${stem}_01_loaded.png`, fullPage:true});
+            await clickTurnstile(page);
+            await page.waitForTimeout(3000);
+
+            const fileInput = page.locator('input[type="file"]');
+            if (!await fileInput.count()) {
+              fs.writeFileSync(`results/${stem}_FAILED_NO_FILE_INPUT.html`, await page.content());
+              fs.writeFileSync(`results/${stem}_events.json`, JSON.stringify(events,null,2));
+              await context.close();
+              return;
+            }
+            await fileInput.first().setInputFiles(path.resolve('clips', clip));
+            await page.waitForTimeout(5000);
+            await page.screenshot({path:`results/${stem}_02_selected.png`, fullPage:true});
+
+            const buttons = page.getByRole('button');
+            const buttonInfo = [];
+            for (let i=0; i<await buttons.count(); i++) {
+              const b=buttons.nth(i);
+              buttonInfo.push({text:(await b.innerText().catch(()=>'')), disabled:(await b.isDisabled().catch(()=>null))});
+            }
+            fs.writeFileSync(`results/${stem}_buttons.json`, JSON.stringify(buttonInfo,null,2));
+
+            let clicked = false;
+            for (const re of [/quick identify/i,/identify music/i,/identify/i,/recognize/i,/submit/i]) {
+              const b = page.getByRole('button', {name:re});
+              if (await b.count()) {
+                await b.first().click({timeout:10000}).catch(()=>{});
+                clicked = true;
+                break;
+              }
+            }
+            if (!clicked) {
+              const candidates = page.locator('button:visible');
+              const n = await candidates.count();
+              if (n) await candidates.nth(n-1).click({timeout:5000}).catch(()=>{});
+            }
+
+            await page.waitForTimeout(30000);
+            await page.screenshot({path:`results/${stem}_03_result.png`, fullPage:true});
+            fs.writeFileSync(`results/${stem}_body.txt`, await page.locator('body').innerText().catch(()=>''));
+            fs.writeFileSync(`results/${stem}_final.html`, await page.content());
+            fs.writeFileSync(`results/${stem}_events.json`, JSON.stringify(events,null,2));
+            await context.close();
+          }
+
+          (async()=>{
+            const browser = await chromium.launch({
+              headless:false,
+              args:['--no-sandbox','--disable-dev-shm-usage','--disable-blink-features=AutomationControlled']
+            });
+            for (const clip of clips) {
+              try { await runClip(browser, clip); }
+              catch (e) { fs.writeFileSync(`results/${clip}_exception.txt`, String(e && e.stack || e)); }
+            }
+            await browser.close();
+          })();
+          JS
+          xvfb-run -a node aha.js
+          find results -maxdepth 1 -type f -printf '%f %s bytes\n' | sort
+
+      - name: Upload ACRCloud evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: aha-bad-friends-identification
+          path: results/
+          if-no-files-found: error
+          retention-days: 1
