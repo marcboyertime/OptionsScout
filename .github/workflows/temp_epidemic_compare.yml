@@ -1,0 +1,269 @@
+name: Temporary compare montage with Epidemic candidates
+
+"on":
+  push:
+    branches:
+      - temp-epidemic-probe-bad-friends-20260904
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Download isolated montage music
+        uses: actions/download-artifact@v4
+        with:
+          name: bad-friends-demucs-identification
+          path: input
+          github-token: ${{ github.token }}
+          repository: marcboyertime/OptionsScout
+          run-id: 33841219671
+
+      - name: Install tools
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg curl jq
+          python -m pip install --upgrade "numpy<3" scipy librosa soundfile requests shazamio==0.8.1
+          mkdir -p catalog previews results
+
+      - name: Build pre-episode candidate set and download previews
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cat > build_candidates.py <<'PY'
+          import json, time
+          from pathlib import Path
+          from urllib.parse import urlencode
+          import requests
+          from datetime import datetime, timezone
+
+          terms = ['retro','synthwave','80s','disco','synth','comedy','quirky']
+          base = 'https://www.epidemicsound.com/json/search/tracks/'
+          cutoff = datetime(2020,6,29,tzinfo=timezone.utc)
+          sess=requests.Session()
+          sess.headers.update({'User-Agent':'Mozilla/5.0'})
+          tracks={}
+          for term in terms:
+              params={'limit':100,'page':1,'term':term,'order':'desc','sort':'relevance'}
+              r=sess.get(base,params=params,timeout=60); r.raise_for_status()
+              data=r.json(); Path(f'catalog/{term}.json').write_text(json.dumps(data))
+              for tid,t in data.get('entities',{}).get('tracks',{}).items():
+                  added=t.get('added')
+                  try: ad=datetime.fromisoformat(added.replace('Z','+00:00')) if added else None
+                  except Exception: ad=None
+                  bpm=float(t.get('bpm') or 0)
+                  if ad and ad<=cutoff and 117<=bpm<=129:
+                      row=tracks.setdefault(tid,t)
+                      row.setdefault('_terms',[]).append(term)
+          selected=[]
+          for tid,t in tracks.items():
+              url=(((t.get('stems') or {}).get('full') or {}).get('lqMp3Url'))
+              if not url: continue
+              artists=[]
+              for a in (((t.get('creatives') or {}).get('mainArtists')) or []):
+                  artists.append(a.get('name') if isinstance(a,dict) else str(a))
+              selected.append({
+                  'id':tid,'kosmosId':t.get('kosmosId'),'title':t.get('title'),
+                  'artists':artists,'bpm':t.get('bpm'),'added':t.get('added'),
+                  'releaseDate':t.get('releaseDate'),'genres':t.get('genres'),
+                  'moods':t.get('moods'),'url':url,'terms':t.get('_terms',[]),
+                  'publicSlug':t.get('publicSlug'),'isrc':t.get('isrc')
+              })
+          selected.sort(key=lambda x:(abs(float(x['bpm'])-123.046875),x['added']))
+          Path('results/candidates.json').write_text(json.dumps(selected,indent=2))
+          print('candidate_count',len(selected))
+          for i,row in enumerate(selected):
+              out=Path('previews')/f'{i:03d}_{row["id"]}.mp3'
+              rr=sess.get(row['url'],timeout=90); rr.raise_for_status(); out.write_bytes(rr.content)
+              print(i,row['title'],row['artists'],row['bpm'],len(rr.content))
+              time.sleep(.1)
+          PY
+          python build_candidates.py | tee results/build_console.txt
+
+      - name: Run robust local audio matching
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cat > compare.py <<'PY'
+          import json, math
+          from pathlib import Path
+          from collections import defaultdict, Counter
+          import numpy as np
+          import librosa
+          from scipy.signal import correlate, correlation_lags
+          from scipy.ndimage import maximum_filter
+
+          SR=11025; HOP=256; NFFT=2048
+          target_file=next(Path('input').rglob('montage_no_dialogue.mp3'))
+          meta=json.loads(Path('results/candidates.json').read_text())
+
+          def load(path,sr=SR):
+              y,_=librosa.load(path,sr=sr,mono=True)
+              y=np.nan_to_num(y)
+              y=y-np.mean(y)
+              return y/(np.std(y)+1e-9)
+
+          target=load(target_file)
+
+          def max_norm_xcorr(q,c):
+              # Compare high-passed/whitened waveforms; q is the 72 s montage stem.
+              q=librosa.effects.preemphasis(q)
+              c=librosa.effects.preemphasis(c)
+              q=(q-q.mean())/(np.linalg.norm(q)+1e-9)
+              c=(c-c.mean())/(np.linalg.norm(c)+1e-9)
+              z=correlate(c,q,mode='valid',method='fft') if len(c)>=len(q) else correlate(q,c,mode='valid',method='fft')
+              i=int(np.argmax(np.abs(z)))
+              return float(abs(z[i])),i/SR
+
+          def features(y):
+              S=np.abs(librosa.stft(y,n_fft=2048,hop_length=HOP))**2
+              mel=librosa.feature.melspectrogram(S=S,sr=SR,n_mels=80)
+              log=librosa.power_to_db(mel+1e-10,ref=np.max)
+              log=(log-log.mean(axis=0,keepdims=True))/(log.std(axis=0,keepdims=True)+1e-8)
+              chroma=librosa.feature.chroma_cqt(y=librosa.effects.harmonic(y),sr=SR,hop_length=HOP)
+              chroma/=np.linalg.norm(chroma,axis=0,keepdims=True)+1e-9
+              onset=librosa.onset.onset_strength(y=y,sr=SR,hop_length=HOP)
+              onset=(onset-onset.mean())/(onset.std()+1e-9)
+              return log,chroma,onset
+
+          target_feat=features(target)
+
+          def subseq_scores(qfeat,cfeat):
+              qmel,qch,qon=qfeat; cmel,cch,con=cfeat
+              # DTW exact-timbre score over multiple 8s target windows.
+              win=max(20,int(8*SR/HOP)); step=max(1,int(4*SR/HOP))
+              vals=[]
+              for s in range(0,max(1,qmel.shape[1]-win+1),step):
+                  qm=qmel[:,s:s+win]; qc=qch[:,s:s+win]
+                  if qm.shape[1]<win: continue
+                  Dm,_=librosa.sequence.dtw(X=qm,Y=cmel,metric='cosine',subseq=True,backtrack=True)
+                  Dc,_=librosa.sequence.dtw(X=qc,Y=cch,metric='cosine',subseq=True,backtrack=True)
+                  mel_cost=float(np.min(Dm[-1])/win)
+                  ch_cost=float(np.min(Dc[-1])/win)
+                  vals.append((mel_cost,ch_cost,s*HOP/SR))
+              vals.sort(key=lambda x:.75*x[0]+.25*x[1])
+              best=vals[:4]
+              # Onset cross-correlation supplies rhythm/phase evidence.
+              if len(con)>=len(qon):
+                  z=correlate(con,qon,mode='valid',method='fft')/max(1,len(qon))
+              else:
+                  z=correlate(qon,con,mode='valid',method='fft')/max(1,len(con))
+              onset=float(np.max(z)) if len(z) else 0
+              return {
+                  'mel_cost':float(np.mean([x[0] for x in best])) if best else 9,
+                  'chroma_cost':float(np.mean([x[1] for x in best])) if best else 9,
+                  'best_target_windows':[x[2] for x in best],
+                  'onset_corr':onset,
+              }
+
+          def peak_hashes(y):
+              S=np.abs(librosa.stft(y,n_fft=NFFT,hop_length=HOP,window='hann'))
+              D=librosa.amplitude_to_db(S+1e-10,ref=np.max)
+              mx=maximum_filter(D,size=(15,9),mode='nearest')
+              mask=(D==mx)&(D>-38)
+              f,t=np.where(mask); vals=D[f,t]
+              buckets=defaultdict(list)
+              for fi,ti,v in zip(f,t,vals): buckets[int(ti//18)].append((float(v),int(fi),int(ti)))
+              peaks=[]
+              for items in buckets.values():
+                  for v,fi,ti in sorted(items,reverse=True)[:10]: peaks.append((ti,fi))
+              by=defaultdict(list)
+              for ti,fi in peaks: by[ti].append(fi)
+              times=sorted(by); out=[]
+              for i,t1 in enumerate(times):
+                  for t2 in times[i+1:]:
+                      dt=t2-t1
+                      if dt>100: break
+                      if dt<10: continue
+                      for f1 in by[t1][:6]:
+                          for f2 in by[t2][:6]: out.append(((f1//3,f2//3,dt//2),t1))
+              return out
+
+          target_hash=peak_hashes(target)
+          def landmark(qhash,c):
+              ch=peak_hashes(c); idx=defaultdict(list)
+              for h,t in ch: idx[h].append(t)
+              offs=Counter(); shared=0
+              for h,qt in qhash:
+                  for ct in idx.get(h,[]):
+                      shared+=1; offs[int(round((ct-qt)/2))]+=1
+              best=0; off=None
+              for o in offs:
+                  v=sum(offs.get(o+d,0) for d in [-2,-1,0,1,2])
+                  if v>best: best=v; off=o
+              return shared,best,None if off is None else off*2*HOP/SR
+
+          rows=[]
+          for i,row in enumerate(meta):
+              p=next(Path('previews').glob(f'{i:03d}_*.mp3'))
+              c=load(p)
+              xf,lag=max_norm_xcorr(target,c)
+              sf=subseq_scores(target_feat,features(c))
+              shared,cluster,off=landmark(target_hash,c)
+              score=(cluster*0.03)+(xf*60)+(sf['onset_corr']*3)-(sf['mel_cost']*2)-(sf['chroma_cost']*.5)
+              rows.append({**row,'file':str(p),'wave_xcorr':xf,'wave_lag_s':lag,
+                           'landmark_shared':shared,'landmark_cluster':cluster,'landmark_offset_s':off,
+                           **sf,'rank_score':score})
+              print(i,row['title'],'xcorr',xf,'cluster',cluster,'mel',sf['mel_cost'],'score',score)
+          rows.sort(key=lambda r:r['rank_score'],reverse=True)
+          Path('results/ranked.json').write_text(json.dumps(rows,indent=2,ensure_ascii=False))
+          with Path('results/ranked.tsv').open('w') as f:
+              cols=['title','artists','bpm','added','genres','moods','wave_xcorr','landmark_cluster','landmark_shared','mel_cost','chroma_cost','onset_corr','rank_score','url']
+              f.write('\t'.join(cols)+'\n')
+              for r in rows:f.write('\t'.join(str(r.get(c,'')) for c in cols)+'\n')
+          print('\nTOP 15')
+          for r in rows[:15]: print(json.dumps({k:r[k] for k in ['title','artists','bpm','added','wave_xcorr','landmark_cluster','mel_cost','chroma_cost','onset_corr','rank_score']},ensure_ascii=False))
+          PY
+          python compare.py | tee results/compare_console.txt
+
+      - name: Shazam the top candidates
+        shell: bash
+        run: |
+          set -u
+          cat > shazam_top.py <<'PY'
+          import asyncio,json
+          from pathlib import Path
+          from shazamio import Shazam
+          rows=json.loads(Path('results/ranked.json').read_text())
+          async def one(r):
+              try:
+                  out=await Shazam().recognize(r['file'])
+                  t=out.get('track') or {}
+                  return {k:r.get(k) for k in ['title','artists','bpm','rank_score']} | {'shazam_title':t.get('title'),'shazam_artist':t.get('subtitle'),'shazam_key':t.get('key'),'shazam_isrc':t.get('isrc'),'matches':out.get('matches') or []}
+              except Exception as e:return {'title':r.get('title'),'error':repr(e)}
+          async def main():
+              out=[]
+              for r in rows[:15]:
+                  out.append(await one(r)); await asyncio.sleep(.5)
+              Path('results/top_shazam.json').write_text(json.dumps(out,indent=2,ensure_ascii=False))
+              print(json.dumps(out,indent=2,ensure_ascii=False))
+          asyncio.run(main())
+          PY
+          python shazam_top.py | tee results/top_shazam_console.txt || true
+
+      - name: Preserve top preview clips and upload evidence
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python - <<'PY'
+          import json,shutil
+          from pathlib import Path
+          rows=json.loads(Path('results/ranked.json').read_text())
+          out=Path('results/top_previews');out.mkdir(exist_ok=True)
+          for i,r in enumerate(rows[:15]):
+              safe=''.join(ch if ch.isalnum() or ch in ' -_' else '_' for ch in r['title'])[:80]
+              shutil.copy2(r['file'],out/f'{i+1:02d}_{safe}.mp3')
+          PY
+      - name: Upload comparison
+        uses: actions/upload-artifact@v4
+        with:
+          name: epidemic-candidate-comparison
+          path: results/
+          if-no-files-found: error
+          retention-days: 1
