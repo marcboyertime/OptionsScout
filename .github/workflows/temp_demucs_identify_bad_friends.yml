@@ -1,0 +1,154 @@
+name: Temporary Demucs identify Bad Friends montage
+
+"on":
+  push:
+    branches:
+      - temp-demucs-identify-bad-friends-20260904
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  identify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Download recovered actual YouTube segment
+        uses: actions/download-artifact@v4
+        with:
+          name: actual-youtube-segment-canine
+          path: input
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: marcboyertime/OptionsScout
+          run-id: 33839729403
+
+      - name: Install separation and recognition tools
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg curl jq
+          python -m pip install --upgrade 'numpy<2.4' torch torchaudio demucs shazamio==0.8.1 librosa soundfile
+          mkdir -p work results
+
+      - name: Extract exact montage and separate vocals
+        shell: bash
+        run: |
+          set -euxo pipefail
+          source_file="$(find input -type f -name review.mp4 | head -n 1)"
+          test -n "$source_file"
+          # review.mp4 starts at 38:00; exact montage is 140.5s-212.5s into it.
+          ffmpeg -hide_banner -loglevel error -y -ss 140.5 -i "$source_file" -t 72 \
+            -vn -ac 2 -ar 44100 -c:a pcm_s16le work/montage.wav
+
+          # Two-stem separation: voice/dialogue versus everything else.
+          python -m demucs --two-stems=vocals -n htdemucs --float32 \
+            -o work/separated work/montage.wav
+
+          no_vocals="$(find work/separated -type f -name no_vocals.wav | head -n 1)"
+          vocals="$(find work/separated -type f -name vocals.wav | head -n 1)"
+          test -n "$no_vocals"
+          test -s "$no_vocals"
+          cp "$no_vocals" work/no_vocals.wav
+          cp "$vocals" work/vocals.wav
+
+          ffmpeg -hide_banner -loglevel error -y -i work/no_vocals.wav \
+            -af 'loudnorm=I=-16:TP=-1.5:LRA=11' -ar 44100 -c:a pcm_s16le \
+            work/no_vocals_norm.wav
+
+          # Produce complementary music-biased variants, since source separation may leave speech.
+          ffmpeg -hide_banner -loglevel error -y -i work/no_vocals_norm.wav \
+            -af 'highpass=f=55,lowpass=f=16000' -c:a pcm_s16le work/music_full.wav
+          ffmpeg -hide_banner -loglevel error -y -ss 8 -i work/music_full.wav -t 56 \
+            -c:a pcm_s16le work/music_core.wav
+
+          mkdir -p work/windows
+          for source in no_vocals_norm music_full music_core; do
+            for start in 0 4 8 12 16 20 24 28 32 36 40 44 48 52 56; do
+              ffmpeg -hide_banner -loglevel error -y -ss "$start" -i "work/${source}.wav" -t 14 \
+                -c:a pcm_s16le "work/windows/${source}_${start}s.wav"
+            done
+          done
+
+          ffmpeg -hide_banner -loglevel error -y -i work/no_vocals_norm.wav \
+            -c:a libmp3lame -b:a 256k results/montage_no_dialogue.mp3
+          ffmpeg -hide_banner -loglevel error -y -i work/vocals.wav \
+            -c:a libmp3lame -b:a 192k results/dialogue_stem.mp3
+
+      - name: Fingerprint separated music
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cat > recognize.py <<'PY'
+          import asyncio, json, pathlib, traceback
+          from collections import Counter
+          from shazamio import Shazam
+
+          files = [pathlib.Path('work/no_vocals_norm.wav'), pathlib.Path('work/music_full.wav'), pathlib.Path('work/music_core.wav')]
+          files += sorted(pathlib.Path('work/windows').glob('*.wav'))
+          sem = asyncio.Semaphore(4)
+
+          async def one(path):
+              async with sem:
+                  try:
+                      out = await Shazam().recognize(str(path))
+                      track = out.get('track') or {}
+                      return {
+                          'file': str(path),
+                          'title': track.get('title'),
+                          'artist': track.get('subtitle'),
+                          'key': track.get('key'),
+                          'isrc': track.get('isrc'),
+                          'releasedate': track.get('releasedate'),
+                          'album': next((m.get('text') for s in track.get('sections',[]) if s.get('type')=='SONG' for m in s.get('metadata',[]) if m.get('title')=='Album'), None),
+                          'preview': next((a.get('uri') for a in (track.get('hub') or {}).get('actions',[]) if a.get('type')=='uri'), None),
+                          'matches': out.get('matches') or [],
+                          'raw': out,
+                      }
+                  except Exception as e:
+                      return {'file': str(path), 'error': repr(e), 'traceback': traceback.format_exc()}
+
+          async def main():
+              rows = await asyncio.gather(*(one(p) for p in files))
+              pathlib.Path('results/demucs_shazam_raw.json').write_text(json.dumps(rows, indent=2, ensure_ascii=False))
+              counts = Counter((r.get('title'),r.get('artist'),r.get('key')) for r in rows if r.get('title'))
+              summary=[]
+              for (title,artist,key),count in counts.most_common():
+                  matched=[r for r in rows if (r.get('title'),r.get('artist'),r.get('key'))==(title,artist,key)]
+                  summary.append({
+                      'title':title,'artist':artist,'key':key,'recognitions':count,
+                      'isrc':next((r.get('isrc') for r in matched if r.get('isrc')),None),
+                      'releasedate':next((r.get('releasedate') for r in matched if r.get('releasedate')),None),
+                      'album':next((r.get('album') for r in matched if r.get('album')),None),
+                      'preview':next((r.get('preview') for r in matched if r.get('preview')),None),
+                      'files':[r['file'] for r in matched],
+                  })
+              pathlib.Path('results/demucs_shazam_summary.json').write_text(json.dumps(summary, indent=2, ensure_ascii=False))
+              print(json.dumps(summary, indent=2, ensure_ascii=False))
+
+          asyncio.run(main())
+          PY
+          python recognize.py | tee results/demucs_shazam_console.txt
+
+          # Independent AudD checks on the cleanest windows.
+          : > results/audd_demucs.tsv
+          for clip in work/windows/no_vocals_norm_8s.wav work/windows/no_vocals_norm_20s.wav work/windows/no_vocals_norm_32s.wav work/windows/no_vocals_norm_44s.wav work/windows/no_vocals_norm_56s.wav work/music_core.wav; do
+            base="$(basename "$clip" .wav)"
+            curl -sS --max-time 90 -F api_token=test -F return=spotify,apple_music -F "file=@$clip" \
+              https://api.audd.io/ > "results/audd_${base}.json" || true
+            printf '%s\t%s\t%s\t%s\n' "$base" \
+              "$(jq -r '.status // empty' "results/audd_${base}.json" 2>/dev/null || true)" \
+              "$(jq -r '.result.artist // empty' "results/audd_${base}.json" 2>/dev/null || true)" \
+              "$(jq -r '.result.title // empty' "results/audd_${base}.json" 2>/dev/null || true)" \
+              >> results/audd_demucs.tsv
+          done
+          cat results/audd_demucs.tsv
+
+      - name: Upload separated stems and evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: bad-friends-demucs-identification
+          path: results/
+          if-no-files-found: error
+          retention-days: 1
