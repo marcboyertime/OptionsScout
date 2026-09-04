@@ -1,0 +1,104 @@
+name: Temporary fast Bad Friends music recognition
+
+"on":
+  push:
+    branches:
+      - temp-identify-bad-friends-quick-20260904
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  recognize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Download recovered YouTube video segment
+        uses: actions/download-artifact@v4
+        with:
+          name: actual-youtube-segment-canine
+          path: input
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: marcboyertime/OptionsScout
+          run-id: 33839729403
+
+      - name: Install tools and prepare selected samples
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg curl jq
+          python -m pip install --upgrade shazamio==0.8.1
+          mkdir -p clips results
+          source_file="$(find input -type f -name review.mp4 | head -n 1)"
+          test -n "$source_file"
+          ffmpeg -hide_banner -loglevel error -y -ss 140.5 -i "$source_file" -t 72 \
+            -vn -ac 2 -ar 44100 -c:a pcm_s16le clips/full.wav
+          ffmpeg -hide_banner -loglevel error -y -i clips/full.wav \
+            -af "pan=mono|c0=FL-FR,loudnorm=I=-16:TP=-1.5:LRA=11" \
+            -ar 44100 -c:a pcm_s16le clips/side.wav
+          for start in 2 10 18 26 34 42 50 58; do
+            ffmpeg -hide_banner -loglevel error -y -ss "$start" -i clips/full.wav -t 14 \
+              -c:a pcm_s16le clips/full_${start}.wav
+            ffmpeg -hide_banner -loglevel error -y -ss "$start" -i clips/side.wav -t 14 \
+              -c:a pcm_s16le clips/side_${start}.wav
+          done
+
+      - name: Run concurrent Shazam and AudD checks
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cat > quick_recognize.py <<'PY'
+          import asyncio, json, pathlib, subprocess
+          from shazamio import Shazam
+
+          clips = sorted(pathlib.Path('clips').glob('full_*.wav')) + sorted(pathlib.Path('clips').glob('side_*.wav'))
+          sem = asyncio.Semaphore(4)
+
+          async def shazam_one(path):
+              async with sem:
+                  try:
+                      out = await Shazam().recognize(str(path))
+                      track = out.get('track') or {}
+                      return {
+                          'file': str(path),
+                          'title': track.get('title'),
+                          'artist': track.get('subtitle'),
+                          'key': track.get('key'),
+                          'url': track.get('url'),
+                          'matches': len(out.get('matches') or []),
+                          'raw': out,
+                      }
+                  except Exception as e:
+                      return {'file': str(path), 'error': repr(e)}
+
+          async def main():
+              rows = await asyncio.gather(*(shazam_one(p) for p in clips))
+              pathlib.Path('results/shazam_quick.json').write_text(json.dumps(rows, indent=2, ensure_ascii=False))
+              for r in rows:
+                  print('SHAZAM', r.get('file'), '=>', r.get('title'), '/', r.get('artist'), r.get('error', ''))
+
+          asyncio.run(main())
+          PY
+          python quick_recognize.py | tee results/shazam_quick_console.txt
+
+          : > results/audd_quick.tsv
+          for clip in clips/full_2.wav clips/full_18.wav clips/full_34.wav clips/full_50.wav clips/side_2.wav clips/side_18.wav clips/side_34.wav clips/side_50.wav; do
+            base="$(basename "$clip" .wav)"
+            curl -sS --max-time 75 -F api_token=test -F "file=@$clip" https://api.audd.io/ \
+              > "results/audd_${base}.json" || true
+            printf '%s\t%s\t%s\n' "$base" \
+              "$(jq -r '.result.artist // empty' "results/audd_${base}.json" 2>/dev/null || true)" \
+              "$(jq -r '.result.title // empty' "results/audd_${base}.json" 2>/dev/null || true)" \
+              >> results/audd_quick.tsv
+          done
+          cat results/audd_quick.tsv
+
+      - name: Upload fast recognition results
+        uses: actions/upload-artifact@v4
+        with:
+          name: bad-friends-fast-recognition-results
+          path: results/
+          if-no-files-found: error
+          retention-days: 1
