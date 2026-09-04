@@ -1,0 +1,116 @@
+name: Temporary direct SongFinder recognition
+
+"on":
+  push:
+    branches:
+      - temp-songfinder-direct-20260904
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  recognize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Download isolated montage music
+        uses: actions/download-artifact@v4
+        with:
+          name: bad-friends-demucs-identification
+          path: input
+          github-token: ${{ github.token }}
+          repository: marcboyertime/OptionsScout
+          run-id: 33841219671
+
+      - name: Prepare browser and clips
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          python -m pip install --upgrade playwright
+          python -m playwright install --with-deps chromium
+          mkdir -p clips results
+          src="$(find input -type f -name montage_no_dialogue.mp3 | head -n 1)"
+          test -n "$src"
+          ffmpeg -hide_banner -loglevel error -y -ss 4  -t 24 -i "$src" -af loudnorm=I=-14:TP=-1.5:LRA=8 -b:a 192k clips/a_04-28.mp3
+          ffmpeg -hide_banner -loglevel error -y -ss 20 -t 24 -i "$src" -af loudnorm=I=-14:TP=-1.5:LRA=8 -b:a 192k clips/b_20-44.mp3
+          ffmpeg -hide_banner -loglevel error -y -ss 36 -t 24 -i "$src" -af loudnorm=I=-14:TP=-1.5:LRA=8 -b:a 192k clips/c_36-60.mp3
+          ffmpeg -hide_banner -loglevel error -y -ss 48 -t 20 -i "$src" -af loudnorm=I=-14:TP=-1.5:LRA=8 -b:a 192k clips/d_48-68.mp3
+
+      - name: Submit from verified browser context
+        shell: bash
+        run: |
+          set -u
+          cat > submit.py <<'PY'
+          import asyncio,json
+          from pathlib import Path
+          from playwright.async_api import async_playwright
+
+          async def main():
+              outputs=[]
+              async with async_playwright() as p:
+                  browser=await p.chromium.launch(headless=True,args=['--no-sandbox','--disable-dev-shm-usage'])
+                  for clip in sorted(Path('clips').glob('*.mp3')):
+                      ctx=await browser.new_context(viewport={'width':1440,'height':1000})
+                      page=await ctx.new_page()
+                      network=[]
+                      async def onresp(resp):
+                          if '/api/recognize/' in resp.url:
+                              try: body=(await resp.text())[:200000]
+                              except Exception as e: body=repr(e)
+                              network.append({'url':resp.url,'status':resp.status,'body':body})
+                      page.on('response',onresp)
+                      row={'clip':clip.name}
+                      try:
+                          await page.goto('https://songfinder.gg/',wait_until='domcontentloaded',timeout=90000)
+                          await page.wait_for_function('window.recaptchaUtil && window.RequestProgress',timeout=90000)
+                          inp=page.locator('input[type=file]').first
+                          await inp.set_input_files(str(clip.resolve()))
+                          await page.wait_for_timeout(1500)
+                          # Call the same primitives the page uses, but return all data directly.
+                          raw=await page.evaluate('''async () => {
+                              const input=document.querySelector('input[type=file]');
+                              if(!input || !input.files || !input.files[0]) throw new Error('file missing');
+                              const token=await window.recaptchaUtil.getRecaptchaToken('fileupload');
+                              const form=new FormData();
+                              form.append('file',input.files[0],input.files[0].name);
+                              form.append('startTime','0');
+                              form.append('recaptchaToken',token);
+                              try {
+                                  const out=await window.RequestProgress.submitWithProgress('/api/recognize/file',form,{});
+                                  return {mode:'RequestProgress',requestId:out && out.requestId,json:out && out.json,keys:out?Object.keys(out):[]};
+                              } catch (firstError) {
+                                  const response=await fetch('/api/recognize/file',{method:'POST',body:form});
+                                  const text=await response.text();
+                                  return {mode:'fetch',firstError:String(firstError),status:response.status,headers:Object.fromEntries(response.headers.entries()),text};
+                              }
+                          }''')
+                          row['result']=raw
+                          await page.screenshot(path=f'results/{clip.stem}.png',full_page=True)
+                      except Exception as e:
+                          row['error']=repr(e)
+                          try:
+                              row['body']=(await page.locator('body').inner_text())[:50000]
+                              await page.screenshot(path=f'results/{clip.stem}_error.png',full_page=True)
+                          except Exception: pass
+                      await page.wait_for_timeout(2000)
+                      row['network']=network
+                      outputs.append(row)
+                      Path(f'results/{clip.stem}.json').write_text(json.dumps(row,indent=2,ensure_ascii=False))
+                      print(json.dumps(row,ensure_ascii=False),flush=True)
+                      await ctx.close()
+                  await browser.close()
+              Path('results/all.json').write_text(json.dumps(outputs,indent=2,ensure_ascii=False))
+          asyncio.run(main())
+          PY
+          python submit.py | tee results/console.txt || true
+
+      - name: Upload recognition result
+        uses: actions/upload-artifact@v4
+        with:
+          name: direct-songfinder-results
+          path: results/
+          if-no-files-found: error
+          retention-days: 1
