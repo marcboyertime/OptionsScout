@@ -1,0 +1,152 @@
+name: Temporary fast validation of Sunset candidate
+
+"on":
+  push:
+    branches:
+      - temp-validate-sunset-fast-20260904
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Download separated montage
+        uses: actions/download-artifact@v4
+        with:
+          name: bad-friends-demucs-identification
+          path: montage
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: marcboyertime/OptionsScout
+          run-id: 33841219671
+
+      - name: Prepare candidate and tools
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg curl
+          python -m pip install --upgrade numpy scipy librosa soundfile shazamio==0.8.1
+          mkdir -p work results
+          curl -L --fail --retry 6 --retry-all-errors --connect-timeout 20 \
+            'https://audio-ssl.itunes.apple.com/itunes-assets/AudioPreview126/v4/b2/e5/b4/b2e5b4dc-ae0d-000e-3200-9c0eb22ff92b/mzaf_5951566959989499908.plus.aac.ep.m4a' \
+            -o work/sunset_preview.m4a
+          montage_file="$(find montage -type f -name montage_no_dialogue.mp3 | head -n 1)"
+          test -n "$montage_file"
+          ffmpeg -hide_banner -loglevel error -y -i "$montage_file" -ac 1 -ar 22050 -c:a pcm_s16le work/montage.wav
+          ffmpeg -hide_banner -loglevel error -y -i work/sunset_preview.m4a -ac 1 -ar 22050 -c:a pcm_s16le work/candidate.wav
+          cp work/sunset_preview.m4a results/sunset_preview.m4a
+
+      - name: Efficient waveform and harmonic comparison
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cat > compare_fast.py <<'PY'
+          import asyncio, json, pathlib
+          import numpy as np
+          import librosa
+          from scipy.signal import correlate
+          from shazamio import Shazam
+
+          SR=22050
+          MONTAGE='work/montage.wav'
+          CAND='work/candidate.wav'
+          ym,_=librosa.load(MONTAGE,sr=SR,mono=True)
+          yc,_=librosa.load(CAND,sr=SR,mono=True)
+
+          def z(x):
+              x=np.asarray(x,dtype=np.float64)
+              x=x-np.mean(x)
+              s=np.std(x)
+              return x/(s+1e-12)
+
+          def norm_valid_xcorr(query, target):
+              # Sliding normalized correlation of query inside target.
+              q=z(query)
+              t=z(target)
+              raw=correlate(t,q,mode='valid',method='fft')
+              n=len(q)
+              cs=np.concatenate(([0.0],np.cumsum(t)))
+              cs2=np.concatenate(([0.0],np.cumsum(t*t)))
+              sums=cs[n:]-cs[:-n]
+              sums2=cs2[n:]-cs2[:-n]
+              var=np.maximum(sums2-(sums*sums)/n,1e-9)
+              denom=np.sqrt(var*np.sum(q*q))
+              corr=raw/denom
+              i=int(np.argmax(np.abs(corr)))
+              return {'score':float(abs(corr[i])),'signed':float(corr[i]),'offset_s':float(i/SR)}
+
+          waveform=[]
+          # Search multiple clean-ish 12, 20, and 30 second montage slices over the candidate preview,
+          # plus plausible playback-rate changes.
+          for dur in [12,20,30]:
+              for start in [4,12,20,28,36,44,52]:
+                  a=int(start*SR); b=min(len(ym),int((start+dur)*SR))
+                  if b-a < int(8*SR): continue
+                  q=ym[a:b]
+                  for rate in [0.86,0.88,0.90,0.94,0.97,1.00,1.03,1.06,1.10,1.14]:
+                      qr=librosa.effects.time_stretch(q,rate=rate) if rate!=1.0 else q
+                      if len(qr)>len(yc): continue
+                      r=norm_valid_xcorr(qr,yc)
+                      r.update({'montage_start_s':start,'duration_s':dur,'rate':rate})
+                      waveform.append(r)
+          waveform.sort(key=lambda x:x['score'],reverse=True)
+
+          # Harmonic comparison with a vectorized frame-similarity matrix and diagonal averaging.
+          hop=512
+          cm=librosa.feature.chroma_cqt(y=ym,sr=SR,hop_length=hop)
+          cc=librosa.feature.chroma_cqt(y=yc,sr=SR,hop_length=hop)
+          cm/=np.linalg.norm(cm,axis=0,keepdims=True)+1e-9
+          cc/=np.linalg.norm(cc,axis=0,keepdims=True)+1e-9
+          S=cm.T@cc
+          diag_results=[]
+          win=max(1,int(round(10*SR/hop)))
+          # Search every possible diagonal offset; use rolling 10-second averages.
+          for off in range(-S.shape[0]+1,S.shape[1]):
+              d=np.diagonal(S,offset=off)
+              if len(d)<win: continue
+              roll=np.convolve(d,np.ones(win)/win,mode='valid')
+              j=int(np.argmax(roll))
+              if off>=0:
+                  mi=j; ci=j+off
+              else:
+                  mi=j-off; ci=j
+              diag_results.append({'score':float(roll[j]),'montage_start_s':float(mi*hop/SR),'candidate_start_s':float(ci*hop/SR),'offset_frames':off})
+          diag_results.sort(key=lambda x:x['score'],reverse=True)
+
+          tempo_m=float(np.atleast_1d(librosa.feature.tempo(y=ym,sr=SR))[0])
+          tempo_c=float(np.atleast_1d(librosa.feature.tempo(y=yc,sr=SR))[0])
+
+          async def identify(path):
+              out=await Shazam().recognize(path)
+              t=out.get('track') or {}
+              return {'title':t.get('title'),'artist':t.get('subtitle'),'key':t.get('key'),'isrc':t.get('isrc'),'matches':len(out.get('matches') or [])}
+
+          ids=asyncio.run(asyncio.gather(identify(CAND),identify(MONTAGE))) if False else None
+          async def get_ids():
+              return await asyncio.gather(identify(CAND),identify(MONTAGE))
+          cand_id,mont_id=asyncio.run(get_ids())
+
+          out={
+              'candidate_identity':cand_id,
+              'montage_identity':mont_id,
+              'best_waveform_matches':waveform[:30],
+              'best_chroma_matches':diag_results[:30],
+              'tempo_bpm':{'montage':tempo_m,'candidate':tempo_c},
+              'durations_s':{'montage':len(ym)/SR,'candidate':len(yc)/SR}
+          }
+          pathlib.Path('results/fast_validation.json').write_text(json.dumps(out,indent=2,ensure_ascii=False))
+          print(json.dumps(out,indent=2,ensure_ascii=False))
+          PY
+          python compare_fast.py | tee results/fast_validation_console.txt
+
+      - name: Upload validation
+        uses: actions/upload-artifact@v4
+        with:
+          name: sunset-fast-validation
+          path: results/
+          if-no-files-found: error
+          retention-days: 1
