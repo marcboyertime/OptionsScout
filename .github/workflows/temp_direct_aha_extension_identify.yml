@@ -1,0 +1,211 @@
+name: Temporary direct AHA extension identify
+
+"on":
+  push:
+    branches:
+      - temp-identify-bad-friends-song-20260904
+    paths:
+      - .github/workflows/temp_direct_aha_extension_identify.yml
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  identify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 18
+    steps:
+      - name: Download extension source and separated music
+        uses: actions/download-artifact@v4
+        with:
+          pattern: '*'
+          path: downloads
+          merge-multiple: false
+          github-token: ${{ github.token }}
+          repository: marcboyertime/OptionsScout
+          run-id: 33847536848
+
+      - name: Download separated music artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: bad-friends-demucs-identification
+          path: music_input
+          github-token: ${{ github.token }}
+          repository: marcboyertime/OptionsScout
+          run-id: 33841219671
+
+      - name: Prepare extension and query samples
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg jq xvfb
+          npm init -y
+          npm install playwright@1.55.0
+          npx playwright install --with-deps chromium
+
+          extzip="$(find downloads -type f -name aha.zip | head -n 1)"
+          if [[ -n "$extzip" ]]; then
+            mkdir -p extension
+            unzip -q "$extzip" -d extension
+          else
+            extdir="$(find downloads -type d -name extension | head -n 1)"
+            test -n "$extdir"
+            cp -a "$extdir" extension
+          fi
+          test -f extension/sandbox.html
+          test -f extension/sandbox.js
+          test -f extension/wasm/ahamusic_signx_bg.wasm
+
+          src="$(find music_input -type f -name montage_no_dialogue.mp3 | head -n 1)"
+          test -n "$src"
+          mkdir -p extension/samples results
+          for start in 0 8 16 24 32 40 48 56 62; do
+            ffmpeg -hide_banner -loglevel error -y -ss "$start" -t 10 -i "$src" \
+              -c:a libopus -b:a 128k -ac 2 -ar 48000 \
+              "extension/samples/music_${start}s.webm"
+          done
+
+          cat > extension/runner.html <<'EOF'
+          <!doctype html><html><head><meta charset="utf-8"><title>AHA Direct Runner</title></head>
+          <body><iframe id="sandbox" src="sandbox.html" style="width:1px;height:1px"></iframe><pre id="out">starting</pre><script src="runner.js"></script></body></html>
+          EOF
+
+          cat > extension/runner.js <<'EOF'
+          (() => {
+            const filenames = [0,8,16,24,32,40,48,56,62].map(x => `samples/music_${x}s.webm`);
+            const out = document.getElementById('out');
+            const iframe = document.getElementById('sandbox');
+            const results = [];
+            let currentResolve = null;
+
+            window.addEventListener('message', (ev) => {
+              if (ev.source !== iframe.contentWindow || !currentResolve) return;
+              const resolve = currentResolve;
+              currentResolve = null;
+              resolve(ev.data);
+            });
+
+            async function identify(filename, key, config) {
+              const response = await fetch(filename);
+              const blob = await response.blob();
+              const data = {
+                sample: blob,
+                sample_bytes: blob.size,
+                tab_url: 'https://www.youtube.com/watch?v=730p91Qiuig',
+                tab_title: `Bad Friends montage ${filename}`,
+                local_lan: 'en-US',
+                app_id: chrome.runtime.id,
+                version: chrome.runtime.getManifest().version,
+                email: '',
+                google_id: '',
+                browser_version: navigator.userAgent,
+                device_id: `direct_${Date.now()}_${Math.floor(Math.random()*100000)}`
+              };
+              return await new Promise((resolve) => {
+                const timer = setTimeout(() => {
+                  if (currentResolve) currentResolve = null;
+                  resolve({status:-99,msg:'timeout'});
+                }, 45000);
+                currentResolve = (value) => { clearTimeout(timer); resolve(value); };
+                iframe.contentWindow.postMessage({data, api_url:'https://extension.doreso.com/v1/aha-music/identify', app_key:key}, '*');
+              });
+            }
+
+            async function run() {
+              await new Promise(resolve => iframe.addEventListener('load', resolve, {once:true}));
+              await new Promise(r => setTimeout(r, 2500));
+              let config = null;
+              try {
+                const u = new URL('https://extension.doreso.com/v1/aha-music/config');
+                u.searchParams.set('email','');
+                u.searchParams.set('device_id',`direct_${Date.now()}`);
+                u.searchParams.set('browser_version',navigator.userAgent);
+                u.searchParams.set('local_lan','en-US');
+                config = await (await fetch(u)).json();
+              } catch (e) { config={error:String(e)}; }
+              const key = config?.data?.app_key || 'cc4bf58d48542b7255be038d42e0f2f2';
+              results.push({kind:'config',config,extension_id:chrome.runtime.id,key_present:!!key});
+              out.textContent = JSON.stringify(results,null,2);
+              for (const filename of filenames) {
+                let result;
+                try { result = await identify(filename,key,config); }
+                catch (e) { result={status:-98,msg:String(e),stack:e?.stack}; }
+                results.push({kind:'recognition',filename,result});
+                out.textContent = JSON.stringify(results,null,2);
+                document.title = `DONE_${results.length}`;
+                await new Promise(r=>setTimeout(r,800));
+              }
+              document.title = 'ALL_DONE';
+              out.textContent = JSON.stringify(results,null,2);
+              window.__AHA_RESULTS__ = results;
+            }
+            run().catch(e => { document.title='FAILED'; out.textContent=String(e?.stack||e); });
+          })();
+          EOF
+
+      - name: Call the signed AHA recognition endpoint
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cat > direct.js <<'JS'
+          const { chromium } = require('playwright');
+          const fs = require('fs');
+          const path = require('path');
+          (async()=>{
+            const extPath = path.resolve('extension');
+            const context = await chromium.launchPersistentContext('', {
+              headless:false,
+              args:[`--disable-extensions-except=${extPath}`,`--load-extension=${extPath}`,'--no-sandbox','--disable-dev-shm-usage']
+            });
+            let extensionId = null;
+            for (let i=0;i<30 && !extensionId;i++) {
+              const workers = context.serviceWorkers();
+              for (const w of workers) {
+                const m=w.url().match(/^chrome-extension:\/\/([^/]+)/);
+                if (m) extensionId=m[1];
+              }
+              if (!extensionId) {
+                const targets = await context.newCDPSession(context.pages()[0] || await context.newPage());
+                const info = await targets.send('Target.getTargets');
+                for (const t of info.targetInfos) {
+                  const m=(t.url||'').match(/^chrome-extension:\/\/([^/]+)/);
+                  if (m) extensionId=m[1];
+                }
+              }
+              if (!extensionId) await new Promise(r=>setTimeout(r,500));
+            }
+            if (!extensionId) throw new Error('Could not resolve loaded extension ID');
+            fs.writeFileSync('results/extension_id.txt',extensionId);
+            const page=await context.newPage();
+            const network=[];
+            page.on('console',m=>network.push({kind:'console',type:m.type(),text:m.text()}));
+            page.on('response',async r=>{
+              if (/extension\.doreso\.com|identify|config/i.test(r.url())) {
+                let text=''; try{text=await r.text()}catch(e){}
+                network.push({kind:'response',url:r.url(),status:r.status(),text:text.slice(0,50000)});
+              }
+            });
+            await page.goto(`chrome-extension://${extensionId}/runner.html`,{waitUntil:'load',timeout:30000});
+            await page.waitForFunction(()=>document.title==='ALL_DONE'||document.title==='FAILED',{timeout:8*60*1000});
+            await page.screenshot({path:'results/final.png',fullPage:true});
+            fs.writeFileSync('results/body.txt',await page.locator('body').innerText());
+            fs.writeFileSync('results/page.html',await page.content());
+            fs.writeFileSync('results/network.json',JSON.stringify(network,null,2));
+            const results=await page.evaluate(()=>window.__AHA_RESULTS__||null);
+            fs.writeFileSync('results/results.json',JSON.stringify(results,null,2));
+            console.log(JSON.stringify(results,null,2));
+            await context.close();
+          })().catch(e=>{fs.writeFileSync('results/exception.txt',String(e?.stack||e));console.error(e);process.exit(1)});
+          JS
+          xvfb-run -a node direct.js | tee results/console.txt
+
+      - name: Upload direct AHA results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: direct-aha-bad-friends-identification
+          path: results/
+          if-no-files-found: warn
+          retention-days: 1
