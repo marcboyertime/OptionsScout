@@ -1,0 +1,154 @@
+name: Temporary validate Sunset candidate
+
+"on":
+  push:
+    branches:
+      - temp-identify-bad-friends-song-20260904
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Download separated montage artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: bad-friends-demucs-identification
+          path: montage
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: marcboyertime/OptionsScout
+          run-id: 33841219671
+
+      - name: Install tools and fetch candidate preview
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg curl
+          python -m pip install --upgrade numpy scipy librosa soundfile shazamio==0.8.1
+          mkdir -p candidate results
+          curl -L --fail --retry 6 --retry-all-errors --connect-timeout 20 \
+            'https://audio-ssl.itunes.apple.com/itunes-assets/AudioPreview126/v4/b2/e5/b4/b2e5b4dc-ae0d-000e-3200-9c0eb22ff92b/mzaf_5951566959989499908.plus.aac.ep.m4a' \
+            -o candidate/sunset_preview.m4a
+          ffmpeg -hide_banner -loglevel error -y -i candidate/sunset_preview.m4a \
+            -ac 2 -ar 44100 -c:a pcm_s16le candidate/sunset_preview.wav
+          ffmpeg -hide_banner -loglevel error -y -i candidate/sunset_preview.m4a \
+            -c:a libmp3lame -b:a 256k results/sunset_preview.mp3
+          ffprobe -v error -show_entries format=duration,size -of default=noprint_wrappers=1 \
+            candidate/sunset_preview.m4a
+
+      - name: Recover exact clean montage stem from source artifact
+        shell: bash
+        run: |
+          set -euxo pipefail
+          # The Demucs artifact includes a 72-second no-dialogue MP3.
+          source_file="$(find montage -type f -name montage_no_dialogue.mp3 | head -n 1)"
+          test -n "$source_file"
+          cp "$source_file" results/montage_no_dialogue.mp3
+          ffmpeg -hide_banner -loglevel error -y -i "$source_file" \
+            -ac 2 -ar 44100 -c:a pcm_s16le candidate/montage_no_dialogue.wav
+
+      - name: Verify preview identity and compute exact/acoustic match scores
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cat > validate.py <<'PY'
+          import asyncio
+          import json
+          from pathlib import Path
+          import numpy as np
+          import librosa
+          from scipy.signal import correlate, correlation_lags
+          from shazamio import Shazam
+
+          sr = 22050
+          montage_path = Path('candidate/montage_no_dialogue.wav')
+          cand_path = Path('candidate/sunset_preview.wav')
+
+          y_m, _ = librosa.load(montage_path, sr=sr, mono=True)
+          y_c, _ = librosa.load(cand_path, sr=sr, mono=True)
+
+          def normalize(x):
+              x = np.asarray(x, dtype=np.float64)
+              x = x - np.mean(x)
+              n = np.linalg.norm(x)
+              return x / n if n else x
+
+          # Direct sample-level cross-correlation after removing DC and scaling.
+          # A reused master recording should be far above unrelated music.
+          def max_xcorr(a, b):
+              a = normalize(a)
+              b = normalize(b)
+              corr = correlate(a, b, mode='full', method='fft')
+              lags = correlation_lags(len(a), len(b), mode='full')
+              i = int(np.argmax(np.abs(corr)))
+              return float(corr[i]), int(lags[i]), float(abs(corr[i]))
+
+          direct, direct_lag, direct_abs = max_xcorr(y_m, y_c)
+
+          # Try plausible playback-rate / pitch-preserving differences.
+          rate_results = []
+          for rate in [0.94,0.96,0.98,0.99,1.00,1.01,1.02,1.04,1.06]:
+              yc = librosa.effects.time_stretch(y_c, rate=rate) if rate != 1.0 else y_c
+              signed, lag, score = max_xcorr(y_m, yc)
+              rate_results.append({'rate': rate, 'score': score, 'signed': signed, 'lag_samples': lag, 'lag_seconds': lag/sr})
+
+          # Chroma and MFCC subsequence matching over 10-second windows.
+          hop = 512
+          chroma_m = librosa.feature.chroma_cqt(y=y_m, sr=sr, hop_length=hop)
+          chroma_c = librosa.feature.chroma_cqt(y=y_c, sr=sr, hop_length=hop)
+          chroma_m /= np.linalg.norm(chroma_m, axis=0, keepdims=True) + 1e-9
+          chroma_c /= np.linalg.norm(chroma_c, axis=0, keepdims=True) + 1e-9
+
+          win = int(round(10*sr/hop))
+          best_chroma = {'score': -1}
+          for mi in range(0, max(1, chroma_m.shape[1]-win+1), 1):
+              mm = chroma_m[:, mi:mi+win]
+              if mm.shape[1] < win: continue
+              for ci in range(0, max(1, chroma_c.shape[1]-win+1), 1):
+                  cc = chroma_c[:, ci:ci+win]
+                  if cc.shape[1] < win: continue
+                  score = float(np.mean(np.sum(mm*cc, axis=0)))
+                  if score > best_chroma['score']:
+                      best_chroma = {'score':score,'montage_start_s':mi*hop/sr,'candidate_start_s':ci*hop/sr}
+
+          # Tempo and key-related diagnostics.
+          tempo_m = float(np.atleast_1d(librosa.feature.tempo(y=y_m, sr=sr))[0])
+          tempo_c = float(np.atleast_1d(librosa.feature.tempo(y=y_c, sr=sr))[0])
+
+          async def identify(path):
+              out = await Shazam().recognize(str(path))
+              t = out.get('track') or {}
+              return {'title':t.get('title'),'artist':t.get('subtitle'),'key':t.get('key'),'isrc':t.get('isrc'),'matches':out.get('matches') or []}
+
+          candidate_id = asyncio.run(identify(cand_path))
+          montage_id = asyncio.run(identify(montage_path))
+
+          result = {
+              'candidate_identity': candidate_id,
+              'montage_full_identity': montage_id,
+              'direct_xcorr': {'signed':direct,'absolute':direct_abs,'lag_samples':direct_lag,'lag_seconds':direct_lag/sr},
+              'time_stretch_xcorr': sorted(rate_results, key=lambda x:x['score'], reverse=True),
+              'best_10s_chroma': best_chroma,
+              'tempo_bpm': {'montage':tempo_m,'candidate':tempo_c},
+              'interpretation': {
+                  'waveform_match_threshold_guidance': 'Same master usually gives a much larger normalized peak than unrelated music; scores near zero reject an exact recording match.'
+              }
+          }
+          Path('results/sunset_validation.json').write_text(json.dumps(result, indent=2, ensure_ascii=False))
+          print(json.dumps(result, indent=2, ensure_ascii=False))
+
+          PY
+          python validate.py | tee results/sunset_validation_console.txt
+
+      - name: Upload validation package
+        uses: actions/upload-artifact@v4
+        with:
+          name: sunset-candidate-validation
+          path: results/
+          if-no-files-found: error
+          retention-days: 1
