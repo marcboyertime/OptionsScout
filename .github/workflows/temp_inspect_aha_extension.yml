@@ -1,0 +1,63 @@
+name: Temporary inspect AHA Music extension
+
+"on":
+  push:
+    branches:
+      - temp-identify-bad-friends-song-20260904
+    paths:
+      - .github/workflows/temp_inspect_aha_extension.yml
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download and unpack Chrome extension
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p output/extension
+          URL='https://clients2.google.com/service/update2/crx?response=redirect&prodversion=152.0.0.0&acceptformat=crx2,crx3&x=id%3Ddpacanjfikmhoddligfbehkpomnbgblf%26uc'
+          curl -L --fail --retry 5 -A 'Mozilla/5.0' "$URL" -o output/aha.crx
+          python3 - <<'PY'
+          from pathlib import Path
+          b=Path('output/aha.crx').read_bytes()
+          i=b.find(b'PK\x03\x04')
+          if i < 0: raise SystemExit('zip signature not found')
+          Path('output/aha.zip').write_bytes(b[i:])
+          print('crx bytes',len(b),'zip offset',i)
+          PY
+          unzip -q output/aha.zip -d output/extension
+          find output/extension -maxdepth 3 -type f -printf '%P %s bytes\n' | sort | tee output/file_list.txt
+          cat output/extension/manifest.json | tee output/manifest_pretty.json
+
+      - name: Extract endpoints and recognition strings
+        shell: bash
+        run: |
+          set -euxo pipefail
+          grep -RInaE 'https?://|recogn|identify|acrcloud|doreso|fingerprint|upload|audio|websocket|extension\.doreso' output/extension \
+            --include='*.js' --include='*.json' --include='*.html' \
+            > output/endpoint_hits.txt || true
+          python3 - <<'PY'
+          from pathlib import Path
+          import re,json
+          rows=[]
+          for p in Path('output/extension').rglob('*'):
+              if p.suffix.lower() not in {'.js','.json','.html'}: continue
+              try: s=p.read_text(errors='ignore')
+              except: continue
+              urls=sorted(set(re.findall(r'https?://[^\"\'\\s)]+',s)))
+              if urls: rows.append({'file':str(p),'urls':urls})
+          Path('output/urls.json').write_text(json.dumps(rows,indent=2))
+          PY
+
+      - name: Upload extension source
+        uses: actions/upload-artifact@v4
+        with:
+          name: aha-extension-source
+          path: output/
+          if-no-files-found: error
+          retention-days: 1
