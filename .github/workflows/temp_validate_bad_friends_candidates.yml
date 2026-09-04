@@ -1,0 +1,183 @@
+name: Temporary validate Bad Friends music candidates
+
+"on":
+  push:
+    branches:
+      - temp-identify-bad-friends-song-20260904
+    paths:
+      - .github/workflows/temp_validate_bad_friends_candidates.yml
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Download montage-recognition artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: bad-friends-montage-recognition-results
+          path: input
+          github-token: ${{ github.token }}
+          repository: marcboyertime/OptionsScout
+          run-id: 33840549645
+
+      - name: Prepare tools and candidate recordings
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg curl
+          python -m pip install --upgrade numpy scipy librosa soundfile
+          mkdir -p candidates results
+
+          curl -L --fail --retry 5 -o candidates/aliens_starlab.m4a \
+            'https://audio-ssl.itunes.apple.com/itunes-assets/AudioPreview112/v4/2a/65/72/2a6572ac-7862-ad6f-c4c6-fb0a483b6880/mzaf_2698493566100487735.plus.aac.ep.m4a'
+          curl -L --fail --retry 5 -o candidates/winter_of_fullness_william_doyle.m4a \
+            'https://audio-ssl.itunes.apple.com/itunes-assets/AudioPreview211/v4/e3/4e/0e/e34e0e03-7a84-b17b-0b2b-c4e160e4474d/mzaf_12526401212195609265.plus.aac.ep.m4a'
+          curl -L --fail --retry 5 -o candidates/osf_the_gradient.m4a \
+            'https://audio-ssl.itunes.apple.com/itunes-assets/AudioPreview221/v4/fe/9c/f9/fe9cf92b-7f30-ed1d-c164-5a7d8311d0c8/mzaf_1721693386426552119.plus.aac.ep.m4a'
+          curl -L --fail --retry 5 -o candidates/no_escape_g32.m4a \
+            'https://audio-ssl.itunes.apple.com/itunes-assets/AudioPreview221/v4/45/d1/5f/45d15f8b-b69f-6e0b-fb6f-af4c4af83d17/mzaf_4457490125646608574.plus.aac.p.m4a'
+          curl -L --fail --retry 5 -o candidates/ginnungagap_the_illustrated.m4a \
+            'https://audio-ssl.itunes.apple.com/itunes-assets/AudioPreview124/v4/a6/30/b4/a630b49c-689f-b321-4466-bbbe5f98056b/mzaf_8772813618162108972.plus.aac.p.m4a'
+
+          for f in candidates/*.m4a; do
+            ffmpeg -hide_banner -loglevel error -y -i "$f" -ac 1 -ar 22050 "${f%.m4a}.wav"
+          done
+          find candidates -type f -maxdepth 1 -printf '%f %s bytes\n'
+
+      - name: Compare candidates to every montage mix
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cat > compare.py <<'PY'
+          from pathlib import Path
+          import json
+          import numpy as np
+          import librosa
+          from scipy import signal
+
+          SR = 11025
+          queries = sorted(Path('input/audio').glob('*.wav'))
+          candidates = sorted(Path('candidates').glob('*.wav'))
+
+          def load_audio(path):
+              y, _ = librosa.load(path, sr=SR, mono=True)
+              y = np.nan_to_num(y).astype(np.float64)
+              sos = signal.butter(4, [80, 4800], btype='bandpass', fs=SR, output='sos')
+              if len(y) > 128:
+                  y = signal.sosfiltfilt(sos, y)
+              y = signal.lfilter([1.0, -0.97], [1.0], y)
+              y -= np.mean(y)
+              y /= np.std(y) + 1e-9
+              return y
+
+          def stretch(y, factor):
+              if abs(factor - 1.0) < 1e-9:
+                  return y
+              return librosa.resample(y, orig_sr=SR, target_sr=int(round(SR * factor)))
+
+          def max_ncc(long_y, short_y):
+              if len(short_y) > len(long_y):
+                  long_y, short_y = short_y, long_y
+              short_y = short_y - np.mean(short_y)
+              ss = np.sum(short_y * short_y)
+              corr = signal.fftconvolve(long_y, short_y[::-1], mode='valid')
+              cs = np.concatenate([[0.0], np.cumsum(long_y * long_y)])
+              local = cs[len(short_y):] - cs[:-len(short_y)]
+              denom = np.sqrt(np.maximum(local * ss, 1e-12))
+              ncc = corr / denom
+              idx = int(np.argmax(np.abs(ncc)))
+              return float(ncc[idx]), idx / SR
+
+          def feature_subsequence_score(query_y, candidate_y):
+              # Compare all 8-second candidate excerpts against the montage using
+              # normalized log-mel features. Exact reused recordings remain strong
+              # even when dialogue is mixed over them.
+              hop = 256
+              def feat(y):
+                  m = librosa.feature.melspectrogram(y=y, sr=SR, n_fft=1024, hop_length=hop,
+                                                     n_mels=48, fmin=80, fmax=4800, power=2.0)
+                  z = librosa.power_to_db(m + 1e-12)
+                  z -= np.mean(z, axis=1, keepdims=True)
+                  z /= np.std(z, axis=1, keepdims=True) + 1e-8
+                  return z
+              Q = feat(query_y)
+              C = feat(candidate_y)
+              win = max(16, int(round(8.0 * SR / hop)))
+              best = (-1e9, None, None)
+              for ci in range(0, max(1, C.shape[1] - win + 1), max(1, win // 4)):
+                  c = C[:, ci:ci+win]
+                  if c.shape[1] < win:
+                      continue
+                  score = None
+                  # Sum per-band cross-correlations along a common lag.
+                  acc = None
+                  for b in range(c.shape[0]):
+                      r = signal.fftconvolve(Q[b], c[b, ::-1], mode='valid')
+                      acc = r if acc is None else acc + r
+                  acc /= (c.shape[0] * win)
+                  qi = int(np.argmax(acc))
+                  s = float(acc[qi])
+                  if s > best[0]:
+                      best = (s, qi * hop / SR, ci * hop / SR)
+              return best
+
+          rows = []
+          raw = {}
+          loaded_q = {q.name: load_audio(q) for q in queries}
+          loaded_c = {c.name: load_audio(c) for c in candidates}
+          for cname, cy0 in loaded_c.items():
+              for qname, qy in loaded_q.items():
+                  best_raw = (-1e9, None, None)
+                  for factor in [0.994, 0.997, 1.0, 1.003, 1.006]:
+                      cy = stretch(cy0, factor)
+                      s, lag = max_ncc(qy, cy)
+                      if abs(s) > abs(best_raw[0]) if best_raw[1] is not None else True:
+                          best_raw = (s, lag, factor)
+                  mel, qtime, ctime = feature_subsequence_score(qy, cy0)
+                  rows.append({
+                      'candidate': cname,
+                      'query': qname,
+                      'raw_ncc': best_raw[0],
+                      'raw_abs_ncc': abs(best_raw[0]),
+                      'query_lag_sec': best_raw[1],
+                      'stretch_factor': best_raw[2],
+                      'mel_score': mel,
+                      'mel_query_sec': qtime,
+                      'mel_candidate_sec': ctime,
+                  })
+
+          rows.sort(key=lambda r: (r['raw_abs_ncc'], r['mel_score']), reverse=True)
+          Path('results/waveform_comparisons.json').write_text(json.dumps(rows, indent=2))
+
+          # Aggregate each candidate by its strongest result across all montage variants.
+          summary = []
+          for cname in loaded_c:
+              rr = [r for r in rows if r['candidate'] == cname]
+              summary.append({
+                  'candidate': cname,
+                  'best_raw_abs_ncc': max(r['raw_abs_ncc'] for r in rr),
+                  'best_raw_match': max(rr, key=lambda r: r['raw_abs_ncc']),
+                  'best_mel_score': max(r['mel_score'] for r in rr),
+                  'best_mel_match': max(rr, key=lambda r: r['mel_score']),
+              })
+          summary.sort(key=lambda r: (r['best_raw_abs_ncc'], r['best_mel_score']), reverse=True)
+          Path('results/candidate_summary.json').write_text(json.dumps(summary, indent=2))
+          print(json.dumps(summary, indent=2))
+          PY
+          python compare.py | tee results/console.txt
+
+      - name: Upload validation evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: bad-friends-candidate-waveform-validation
+          path: |
+            results/
+            candidates/*.m4a
+          if-no-files-found: error
+          retention-days: 1
