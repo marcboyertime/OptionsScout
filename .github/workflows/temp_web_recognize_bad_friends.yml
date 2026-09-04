@@ -1,0 +1,180 @@
+name: Temporary independent web recognition for Bad Friends montage
+
+"on":
+  push:
+    branches:
+      - temp-web-recognize-bad-friends-20260904
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  recognize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Download isolated montage music
+        uses: actions/download-artifact@v4
+        with:
+          name: bad-friends-demucs-identification
+          path: input
+          github-token: ${{ github.token }}
+          repository: marcboyertime/OptionsScout
+          run-id: 33841219671
+
+      - name: Prepare clips and browser
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          python -m pip install --upgrade playwright
+          python -m playwright install --with-deps chromium
+          mkdir -p clips results
+          source_file="$(find input -type f -name 'montage_no_dialogue.mp3' | head -n 1)"
+          test -n "$source_file"
+          ffmpeg -hide_banner -loglevel error -y -ss 8  -t 20 -i "$source_file" -af loudnorm=I=-14:TP=-1.5:LRA=8 -b:a 192k clips/stem_08s-28s.mp3
+          ffmpeg -hide_banner -loglevel error -y -ss 24 -t 20 -i "$source_file" -af loudnorm=I=-14:TP=-1.5:LRA=8 -b:a 192k clips/stem_24s-44s.mp3
+          ffmpeg -hide_banner -loglevel error -y -ss 40 -t 20 -i "$source_file" -af loudnorm=I=-14:TP=-1.5:LRA=8 -b:a 192k clips/stem_40s-60s.mp3
+
+      - name: Upload clips to independent recognizers
+        shell: bash
+        run: |
+          set -u
+          cat > recognize_sites.py <<'PY'
+          import asyncio, json, re, time
+          from pathlib import Path
+          from playwright.async_api import async_playwright
+
+          clips = sorted(Path('clips').glob('*.mp3'))
+          sites = [
+              {'name':'songfinder','url':'https://songfinder.gg/','buttons':['Start Recognition','Identify Song','Recognize']},
+              {'name':'aha','url':'https://aha-music.com/upload','buttons':['Identify','Quick Identify','Recognize']},
+              {'name':'musikerkennung','url':'https://musikerkennung.com/en','buttons':['Recognize']},
+          ]
+          out=[]
+
+          async def click_any(page, texts):
+              for text in texts:
+                  patterns=[f'button:has-text("{text}")',f'[role=button]:has-text("{text}")',f'input[type=submit][value*="{text}"]']
+                  for sel in patterns:
+                      try:
+                          loc=page.locator(sel)
+                          if await loc.count():
+                              await loc.first.click(timeout=5000, force=True)
+                              return sel
+                      except Exception:
+                          pass
+              return None
+
+          async def run_one(browser, site, clip):
+              context=await browser.new_context(accept_downloads=True, viewport={'width':1440,'height':1000})
+              page=await context.new_page()
+              records=[]
+              async def capture_response(resp):
+                  try:
+                      req=resp.request
+                      if req.method != 'GET' or any(k in resp.url.lower() for k in ['recogn','upload','identify','result','acr','audd','song']):
+                          ct=(await resp.all_headers()).get('content-type','')
+                          body=''
+                          if any(x in ct for x in ['json','text','javascript']):
+                              body=(await resp.text())[:200000]
+                          records.append({'url':resp.url,'status':resp.status,'method':req.method,'content_type':ct,'body':body})
+                  except Exception as e:
+                      records.append({'capture_error':repr(e),'url':getattr(resp,'url','')})
+              page.on('response', capture_response)
+              item={'site':site['name'],'clip':clip.name,'url':site['url']}
+              try:
+                  await page.goto(site['url'],wait_until='domcontentloaded',timeout=90000)
+                  await page.wait_for_timeout(8000)
+                  # Some pages ask for a one-click verification before exposing the uploader.
+                  for phrase in ['Click once to verify','Verify','I am human']:
+                      try:
+                          loc=page.get_by_text(phrase,exact=False)
+                          if await loc.count():
+                              await loc.first.click(timeout=3000,force=True)
+                              await page.wait_for_timeout(5000)
+                      except Exception:
+                          pass
+                  inputs=page.locator('input[type=file]')
+                  count=await inputs.count()
+                  item['file_input_count']=count
+                  if not count:
+                      item['initial_body']=(await page.locator('body').inner_text())[:30000]
+                      raise RuntimeError('No file input found')
+                  set_ok=False
+                  for i in range(count):
+                      try:
+                          await inputs.nth(i).set_input_files(str(clip.resolve()),timeout=10000)
+                          set_ok=True; item['file_input_index']=i; break
+                      except Exception:
+                          pass
+                  if not set_ok: raise RuntimeError('Unable to set any file input')
+                  await page.wait_for_timeout(3000)
+                  item['button_clicked']=await click_any(page,site['buttons'])
+                  if not item['button_clicked']:
+                      # Submit nearby form as fallback.
+                      try:
+                          form=inputs.nth(item['file_input_index']).locator('xpath=ancestor::form[1]')
+                          if await form.count():
+                              await form.evaluate('(f)=>f.requestSubmit()')
+                              item['button_clicked']='form.requestSubmit'
+                      except Exception:
+                          pass
+                  await page.wait_for_timeout(3000)
+                  # Wait up to 90 seconds for a result or clear failure.
+                  previous=''
+                  stable=0
+                  for _ in range(45):
+                      body=(await page.locator('body').inner_text())
+                      low=body.lower()
+                      if body==previous: stable+=1
+                      else: stable=0; previous=body
+                      if any(x in low for x in ['no match','song found','identified song','recognition result','spotify','apple music','shazam']) and 'analyzing audio' not in low:
+                          await page.wait_for_timeout(4000)
+                          break
+                      if stable>=8 and _>=12: break
+                      await page.wait_for_timeout(2000)
+                  item['final_url']=page.url
+                  item['body_text']=(await page.locator('body').inner_text())[:60000]
+                  await page.screenshot(path=f'results/{site["name"]}_{clip.stem}.png',full_page=True)
+              except Exception as e:
+                  item['error']=repr(e)
+                  try:
+                      item['body_text']=(await page.locator('body').inner_text())[:60000]
+                      await page.screenshot(path=f'results/{site["name"]}_{clip.stem}_error.png',full_page=True)
+                  except Exception:
+                      pass
+              item['network']=records
+              Path(f'results/{site["name"]}_{clip.stem}.json').write_text(json.dumps(item,indent=2,ensure_ascii=False))
+              await context.close()
+              return item
+
+          async def main():
+              async with async_playwright() as p:
+                  browser=await p.chromium.launch(headless=True,args=['--no-sandbox','--disable-dev-shm-usage'])
+                  for site in sites:
+                      for clip in clips:
+                          print('RUN',site['name'],clip.name,flush=True)
+                          result=await run_one(browser,site,clip)
+                          out.append(result)
+                          print(json.dumps({k:result.get(k) for k in ['site','clip','final_url','button_clicked','error']},ensure_ascii=False),flush=True)
+                      await asyncio.sleep(2)
+                  await browser.close()
+              Path('results/all_results.json').write_text(json.dumps(out,indent=2,ensure_ascii=False))
+              with Path('results/body_texts.txt').open('w') as f:
+                  for r in out:
+                      f.write('\n\n===== '+r['site']+' / '+r['clip']+' =====\n')
+                      f.write(r.get('body_text',''))
+          asyncio.run(main())
+          PY
+          python recognize_sites.py | tee results/console.txt || true
+
+      - name: Upload web-recognition evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: independent-web-recognition-results
+          path: results/
+          if-no-files-found: error
+          retention-days: 1
