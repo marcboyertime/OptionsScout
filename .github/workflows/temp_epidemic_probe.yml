@@ -1,0 +1,37 @@
+name: Temporary Epidemic Sound public catalog probe
+
+"on":
+  push:
+    branches:
+      - temp-epidemic-probe-bad-friends-20260904
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Query public catalog endpoints
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y curl jq
+          mkdir -p results
+          base='https://www.epidemicsound.com/json/search/tracks/'
+          terms=('retro' 'synthwave' '80s' 'disco' 'synth' 'comedy' 'quirky')
+          for term in "${terms[@]}"; do
+            enc="$(python -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))' "$term")"
+            url="${base}?limit=100&page=1&term=${enc}&order=desc&sort=relevance"
+            curl -fL --retry 4 --retry-all-errors -A 'Mozilla/5.0' "$url" -o "results/${term}.json"
+            echo "=== ${term} ==="
+            jq '{meta:.meta, track_count:(.entities.tracks|length), first:(.entities.tracks|to_entries[0].value)}' "results/${term}.json" | tee "results/${term}_summary.json"
+          done
+      - name: Upload probe
+        uses: actions/upload-artifact@v4
+        with:
+          name: epidemic-public-catalog-probe
+          path: results/
+          retention-days: 1
